@@ -27,6 +27,7 @@ Keys:
   R            rotate the video view 90 degrees
 """
 import bisect
+import io
 import json
 import math
 import os
@@ -978,11 +979,15 @@ class App(Gtk.Application):
         menu = Gio.Menu()
         menu.append("Add marker at current position  (M)", "win.add-marker")
         menu.append("Play clean audio track", "win.clean-audio")
+        menu.append("Export group view as PDF…", "win.export-pdf")
         mb = Gtk.MenuButton(icon_name="open-menu-symbolic", menu_model=menu)
         header.pack_end(mb)
         self.win.set_titlebar(header)
         act = Gio.SimpleAction.new("add-marker", None)
         act.connect("activate", lambda *_: self.add_marker())
+        self.win.add_action(act)
+        act = Gio.SimpleAction.new("export-pdf", None)
+        act.connect("activate", lambda *_: self.export_pdf())
         self.win.add_action(act)
         self.clean_act = Gio.SimpleAction.new_stateful(
             "clean-audio", None, GLib.Variant.new_boolean(False))
@@ -1143,6 +1148,68 @@ class App(Gtk.Application):
         self.add_btn.set_sensitive(self.can_add() and not self._conflict)
 
     # -- sequence diagram --------------------------------------------------
+    def export_pdf(self):
+        """Ask for a file name, then save the group view as a vector PDF on an A4 page."""
+        dialog = Gtk.FileDialog(title="Export group view as PDF")
+        dialog.set_initial_name(self.path.get_basename().rsplit(".", 1)[0] + "-groups.pdf")
+        dialog.set_initial_folder(self.path.get_parent())
+        flt = Gtk.FileFilter()
+        flt.set_name("PDF")
+        flt.add_suffix("pdf")
+        dialog.set_default_filter(flt)
+
+        def done(dlg, res):
+            try:
+                f = dlg.save_finish(res)
+            except GLib.Error:
+                return  # cancelled
+            try:
+                self.write_diagram_pdf(f.get_path())
+                self.status_message(f"Saved {f.get_basename()}")
+            except Exception as e:
+                print("pdf export failed:", e, file=sys.stderr)
+                self.status_message(f"PDF export failed: {e}")
+        dialog.save(self.win, None, done)
+
+    def status_message(self, text):
+        self.seg_status.set_text(text)
+        GLib.timeout_add(4000, lambda: self.update_add_state() or False)
+
+    def write_diagram_pdf(self, filename):
+        import cairo
+        w, h = self.diagram_overlay.get_width(), self.diagram_overlay.get_height()
+        if not w or not h:
+            raise RuntimeError("the group view is empty")
+        self.active_layer.set_visible(False)   # no "current segment" ring on paper
+        try:
+            snap = Gtk.Snapshot()
+            Gtk.Overlay.do_snapshot(self.diagram_overlay, snap)
+            node = snap.to_node()
+            if node is None:
+                raise RuntimeError("nothing to draw")
+        finally:
+            self.active_layer.set_visible(True)
+        pw, ph = 595.28, 841.89                 # A4 in points
+        if w > h:
+            pw, ph = ph, pw                      # wide diagram: landscape page
+        margin = 28
+        scale = min((pw - 2 * margin) / w, (ph - 2 * margin) / h)   # points per widget pixel
+        k = min(300 / 72 * scale, 16000 / max(w, h))                # render at about 300 dpi
+        node = Gsk.TransformNode.new(node, Gsk.Transform.new().scale(k, k))
+        texture = self.win.get_native().get_renderer().render_texture(
+            node, Graphene.Rect().init(0, 0, w * k, h * k))
+        image = cairo.ImageSurface.create_from_png(io.BytesIO(texture.save_to_png_bytes().get_data()))
+        surface = cairo.PDFSurface(filename, pw, ph)
+        cr = cairo.Context(surface)
+        cr.set_source_rgb(1, 1, 1)
+        cr.paint()
+        cr.translate((pw - w * scale) / 2, (ph - h * scale) / 2)   # centred
+        cr.scale(scale / k, scale / k)
+        cr.set_source_surface(image, 0, 0)
+        cr.get_source().set_filter(cairo.FILTER_BEST)
+        cr.paint()
+        surface.finish()
+
     def build_diagram(self):
         self.diagram_box = SnakeBox()
         for m in ("top", "bottom", "start", "end"):
@@ -1151,6 +1218,7 @@ class App(Gtk.Application):
         self.diagram_box.on_layout = self.active_layer.queue_draw
         overlay = Gtk.Overlay(child=self.diagram_box)
         overlay.add_overlay(self.active_layer)
+        self.diagram_overlay = overlay
         sw = Gtk.ScrolledWindow(child=overlay)
         sw.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
         sw.set_propagate_natural_width(True)  # extra columns make the diagram wider
