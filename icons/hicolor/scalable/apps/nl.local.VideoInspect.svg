@@ -1,0 +1,28 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#34364f"/>
+      <stop offset="1" stop-color="#1d1e2f"/>
+    </linearGradient>
+    <linearGradient id="screen" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#4a4f7a"/>
+      <stop offset="1" stop-color="#2a2c45"/>
+    </linearGradient>
+  </defs>
+  <!-- app tile -->
+  <rect x="16" y="16" width="480" height="480" rx="112" fill="url(#bg)"/>
+  <!-- video frame with play button -->
+  <rect x="72" y="72" width="368" height="232" rx="28" fill="url(#screen)" stroke="#ffffff" stroke-opacity="0.18" stroke-width="4"/>
+  <circle cx="256" cy="188" r="64" fill="#ffffff" fill-opacity="0.14"/>
+  <path d="M236 150 L236 226 L298 188 Z" fill="#ffffff" stroke="#ffffff" stroke-width="10" stroke-linejoin="round"/>
+  <!-- timeline: track, coloured segments, bookmark arrow, playhead -->
+  <rect x="72" y="352" width="368" height="44" rx="10" fill="#ffffff" fill-opacity="0.12"/>
+  <rect x="72"  y="352" width="86"  height="44" rx="10" fill="#7e57c2"/>
+  <rect x="162" y="352" width="56"  height="44" fill="#ef8a3c"/>
+  <rect x="222" y="352" width="46"  height="44" fill="#26a69a"/>
+  <rect x="272" y="352" width="56"  height="44" fill="#5c8de0"/>
+  <rect x="332" y="352" width="48"  height="44" fill="#d6568a"/>
+  <rect x="384" y="352" width="56"  height="44" rx="10" fill="#8bb23a"/>
+  <path d="M164 322 L204 322 L184 352 Z" fill="#ff4f93"/>
+  <rect x="296" y="332" width="10" height="84" rx="5" fill="#ff3b30"/>
+</svg>

@@ -13,7 +13,6 @@ Keys:
   , / .        step one frame back / forward
   I / O        set start / end marker at current position
   P / Enter    play between the markers
-  L            toggle looping of the selection
   Home / End   jump to start / end marker
   C            clear markers
   [ / ]        slower / faster playback
@@ -23,6 +22,8 @@ Keys:
                P loops the combined time range
   R            rotate the video view 90 degrees
 """
+import json
+import math
 import os
 import re
 import sqlite3
@@ -36,7 +37,8 @@ gi.require_version("Gdk", "4.0")
 gi.require_version("Graphene", "1.0")
 gi.require_version("Gsk", "4.0")
 gi.require_version("Gst", "1.0")
-from gi.repository import Gdk, Gio, GLib, Graphene, Gsk, Gst, Gtk  # noqa: E402
+gi.require_version("Pango", "1.0")
+from gi.repository import Gdk, Gio, GLib, Graphene, Gsk, Gst, Gtk, Pango  # noqa: E402
 
 Gst.init(None)
 
@@ -56,6 +58,29 @@ DIAGRAM_COLORS = ["#7e57c2", "#ef8a3c", "#26a69a", "#5c8de0", "#d6568a",
                   "#8bb23a", "#b5882b", "#4f6d7a"]
 def hex_rgb(h):
     return tuple(int(h[i:i + 2], 16) / 255 for i in (1, 3, 5))
+
+
+APP_ID = "nl.local.VideoInspect"
+APP_DIR = os.path.dirname(os.path.abspath(__file__))
+SETTINGS_FILE = os.path.join(GLib.get_user_config_dir(), "video-inspect", "window.json")
+
+
+def load_window_state():
+    try:
+        with open(SETTINGS_FILE) as f:
+            d = json.load(f)
+        return (max(400, int(d["width"])), max(300, int(d["height"])), bool(d["maximized"]))
+    except (OSError, ValueError, KeyError, TypeError):
+        return 1650, 760, False
+
+
+def save_window_state(width, height, maximized):
+    try:
+        os.makedirs(os.path.dirname(SETTINGS_FILE), exist_ok=True)
+        with open(SETTINGS_FILE, "w") as f:
+            json.dump({"width": width, "height": height, "maximized": maximized}, f)
+    except OSError as e:
+        print("could not save window state:", e, file=sys.stderr)
 
 
 SPEEDS = [0.1, 0.25, 0.5, 0.75, 1.0, 1.5, 2.0]
@@ -197,6 +222,49 @@ class VideoView(Gtk.Widget):
         snap.restore()
 
 
+class ArrowLayer(Gtk.Widget):
+    """Transparent overlay that draws straight arrows between widgets (circle to circle)."""
+
+    def __init__(self):
+        super().__init__()
+        self.edges = []  # (source widget, target widget)
+        self.set_can_target(False)
+        self.set_can_focus(False)
+
+    def do_snapshot(self, snap):
+        fg = self.get_color()
+        col = Gdk.RGBA()
+        col.red, col.green, col.blue, col.alpha = fg.red, fg.green, fg.blue, 0.8
+        stroke = Gsk.Stroke.new(1.3)
+        for src, dst in self.edges:
+            ok1, a = src.compute_bounds(self)
+            ok2, b = dst.compute_bounds(self)
+            if not (ok1 and ok2):
+                continue
+            ax, ay = a.get_x() + a.get_width() / 2, a.get_y() + a.get_height() / 2
+            bx, by = b.get_x() + b.get_width() / 2, b.get_y() + b.get_height() / 2
+            d = math.hypot(bx - ax, by - ay) or 1
+            ux, uy = (bx - ax) / d, (by - ay) / d
+            # a short arrow (about the size of the "↓" labels) centred halfway between
+            # the two circles and pointing from the source towards the target
+            length = min(15, max(0, d - a.get_width() / 2 - b.get_width() / 2 - 8))
+            mx, my = (ax + bx) / 2, (ay + by) / 2
+            x1, y1 = mx - ux * length / 2, my - uy * length / 2
+            x2, y2 = mx + ux * length / 2, my + uy * length / 2
+            pb = Gsk.PathBuilder.new()
+            pb.move_to(x1, y1)
+            pb.line_to(x2, y2)
+            snap.append_stroke(pb.to_path(), stroke, col)
+            # arrow head at the target end
+            hl, hw = 5, 3
+            hb = Gsk.PathBuilder.new()
+            hb.move_to(x2, y2)
+            hb.line_to(x2 - ux * hl - uy * hw, y2 - uy * hl + ux * hw)
+            hb.line_to(x2 - ux * hl + uy * hw, y2 - uy * hl - ux * hw)
+            hb.close()
+            snap.append_fill(hb.to_path(), Gsk.FillRule.WINDING, col)
+
+
 class Timeline(Gtk.Widget):
     """Seekable timeline that also shows the start/end markers."""
 
@@ -227,6 +295,13 @@ class Timeline(Gtk.Widget):
                 return m
         return None
 
+    def segment_at(self, x, y):
+        """Segment (id, start, end, description) whose block in the lane is under (x, y), or None."""
+        if not (9 <= y <= 17):
+            return None
+        t = self._pos_from_x(x)
+        return next((sg for sg in self.app.segments if sg[1] <= t < sg[2]), None)
+
     def on_tooltip(self, widget, x, y, keyboard, tooltip):
         m = self.marker_at(x, y)
         if m:
@@ -243,14 +318,22 @@ class Timeline(Gtk.Widget):
 
     def on_begin(self, gesture, x, y):
         self._drag_x0 = x
-        self._on_marker = self.marker_at(x, y)
-        if self._on_marker:
-            self.app.open_marker_dialog(self._on_marker)
+        self._no_seek = False
+        m = self.marker_at(x, y)
+        if m:
+            self._no_seek = True
+            self.app.open_marker_dialog(m)
+            return
+        seg = self.segment_at(x, y)
+        if seg:  # click on a block in the segment lane: select that segment
+            self._no_seek = True
+            shift = gesture.get_current_event_state() & Gdk.ModifierType.SHIFT_MASK
+            self.app.select_segment(seg[0], bool(shift))
             return
         self.app.seek(self._pos_from_x(x), user=True)
 
     def on_update(self, gesture, dx, dy):
-        if getattr(self, "_on_marker", None):
+        if getattr(self, "_no_seek", False):
             return
         self.app.seek(self._pos_from_x(self._drag_x0 + dx), user=True)
 
@@ -314,17 +397,44 @@ def display_desc(descs):
     return descs[0]
 
 
-def find_structure(tokens):
-    """Split a token sequence into single segments and repeated series.
+def _fork_count(tokens, i, mode):
+    """Length of a 'fork' pattern at i, or 0.
 
-    Returns ("seg", i) or ("group", i, length, count) nodes: a group is
-    tokens[i:i+length] repeated `count` (>= 2) times back to back. At each
-    position the repetition covering the most segments wins (shorter pattern
-    on ties). Segments without a description (None) never form a repetition.
+    mode "in":  P1 B P2 B ... Pk B  -> different segments (Pj) that all lead into one B.
+    mode "out": B P1 B P2 ... B Pk  -> one B that leads into different segments (Pj).
+    B must have a description and every Pj must differ from B. Needs k >= 2.
+    """
+    n, k = len(tokens), 0
+    if mode == "in":
+        b = tokens[i + 1] if i + 1 < n else None
+        if b is None:
+            return 0
+        while i + 2 * k + 1 < n and tokens[i + 2 * k + 1] == b and tokens[i + 2 * k] != b:
+            k += 1
+    else:
+        b = tokens[i]
+        if b is None:
+            return 0
+        while i + 2 * k + 1 < n and tokens[i + 2 * k] == b and tokens[i + 2 * k + 1] != b:
+            k += 1
+    return k if k >= 2 else 0
+
+
+def find_structure(tokens):
+    """Split a token sequence into single segments, repeated series and forks.
+
+    Returns nodes of three kinds:
+      ("seg", i)                    a single segment
+      ("group", i, length, count)   tokens[i:i+length] repeated `count` (>= 2) times back to back
+      ("fork", i, count, mode)      see _fork_count: e.g. ice / boogie / shorty / boogie, where the
+                                    two different segments sit side by side above one common boogie
+    At each position the pattern covering the most segments wins; a plain repeated
+    series beats a fork on ties, and a shorter series beats a longer one.
+    Segments without a description (None) never form a repetition.
     """
     n, out, i = len(tokens), [], 0
     while i < n:
-        best = None
+        best, cover = None, 0
         if tokens[i] is not None:
             for length in range(1, (n - i) // 2 + 1):
                 pat = tokens[i:i + length]
@@ -333,11 +443,15 @@ def find_structure(tokens):
                 k = 1
                 while tokens[i + k * length:i + (k + 1) * length] == pat:
                     k += 1
-                if k >= 2 and (best is None or length * k > best[0] * best[1]):
-                    best = (length, k)
+                if k >= 2 and length * k > cover:
+                    best, cover = ("group", i, length, k), length * k
+        for mode in ("in", "out"):
+            k = _fork_count(tokens, i, mode)
+            if k and 2 * k > cover:
+                best, cover = ("fork", i, k, mode), 2 * k
         if best:
-            out.append(("group", i, best[0], best[1]))
-            i += best[0] * best[1]
+            out.append(best)
+            i += cover
         else:
             out.append(("seg", i))
             i += 1
@@ -424,7 +538,7 @@ class SegmentDB:
 
 class App(Gtk.Application):
     def __init__(self):
-        super().__init__(application_id="nl.local.VideoInspect",
+        super().__init__(application_id=APP_ID,
                          flags=Gio.ApplicationFlags.HANDLES_COMMAND_LINE)
         self.path = None
         self.media = None
@@ -481,7 +595,18 @@ class App(Gtk.Application):
         Gtk.StyleContext.add_provider_for_display(
             Gdk.Display.get_default(), css, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
         self.win = Gtk.ApplicationWindow(application=self, title="Video Inspect")
-        self.win.set_default_size(1650, 760)
+        # app icon (looked up in ./icons, or in the installed icon theme)
+        Gtk.IconTheme.get_for_display(Gdk.Display.get_default()).add_search_path(
+            os.path.join(APP_DIR, "icons"))
+        Gtk.Window.set_default_icon_name(APP_ID)
+
+        # restore the window size / maximized state of the previous session
+        width, height, maximized = load_window_state()
+        self.win_size = (width, height)  # last non-maximized size
+        self.win.set_default_size(width, height)
+        if maximized:
+            self.win.maximize()
+        self.win.connect("close-request", self.on_close_request)
 
         header = Gtk.HeaderBar()
         menu = Gio.Menu()
@@ -524,8 +649,6 @@ class App(Gtk.Application):
                 g.append(w)
             return g
 
-        self.loop_chk = Gtk.CheckButton(label="Loop")
-        self.loop_chk.set_active(True)
         self.speed_dd = Gtk.DropDown.new_from_strings([f"{r:g}x" for r in SPEEDS])
         self.speed_dd.set_selected(SPEEDS.index(1.0))
         self.speed_dd.set_tooltip_text("[ slower, ] faster")
@@ -546,7 +669,7 @@ class App(Gtk.Application):
                   btn("Go to start", self.goto_start, "Home"),
                   btn("Go to end", self.goto_end, "End"),
                   btn("Clear", self.clear_markers, "C")),
-            group(btn("▶ Play selection", self.play_selection, "P / Enter"), self.loop_chk),
+            group(btn("▶ Play selection", self.play_selection, "P / Enter")),
             group(Gtk.Label(label="Speed"), self.speed_dd),
         ]
         for i, g in enumerate(groups):
@@ -594,11 +717,6 @@ class App(Gtk.Application):
         self.segdb = SegmentDB(db_path)
         self.markers = self.segdb.markers()
 
-        title = Gtk.Label(label="Segments", xalign=0)
-        title.add_css_class("heading")
-        dbl = Gtk.Label(label=os.path.basename(db_path), xalign=0)
-        dbl.add_css_class("dim-label")
-        dbl.set_ellipsize(3)
         self.seg_list = Gtk.ListBox()
         self.seg_list.set_selection_mode(Gtk.SelectionMode.NONE)
         self.seg_rows = []
@@ -625,8 +743,6 @@ class App(Gtk.Application):
         panel.set_size_request(340, -1)
         for m in ("top", "bottom", "start", "end"):
             getattr(panel, f"set_margin_{m}")(8)
-        panel.append(title)
-        panel.append(dbl)
         panel.append(frame)
         panel.append(self.pick_label)
         panel.append(self.seg_status)
@@ -659,7 +775,7 @@ class App(Gtk.Application):
         for m in ("top", "bottom", "start", "end"):
             getattr(self.diagram_box, f"set_margin_{m}")(8)
         sw = Gtk.ScrolledWindow(child=self.diagram_box)
-        sw.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        sw.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
         sw.set_overlay_scrolling(False)  # keep the scrollbar visible when it overflows
         self.diagram_sw = sw
 
@@ -687,9 +803,13 @@ class App(Gtk.Application):
         def arrow():
             return Gtk.Label(label="↓", halign=Gtk.Align.START, margin_start=14)
 
-        def item(i, occ):
-            vb = Gtk.Box(spacing=8)
-            circle = Gtk.Button(label=str(i + 1), valign=Gtk.Align.CENTER)
+        def item(i, occ, compact=False):
+            if compact:  # circle above caption, used for segments placed side by side
+                vb = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+            else:
+                vb = Gtk.Box(spacing=8)
+            circle = Gtk.Button(label=str(i + 1), valign=Gtk.Align.CENTER,
+                                halign=Gtk.Align.CENTER if compact else Gtk.Align.FILL)
             circle.add_css_class("seg-circle")
             circle.add_css_class(f"c{color_of[tokens[i]]}" if tokens[i] is not None else "c7")
             circle.occ = [segs[j] for j in occ]
@@ -704,18 +824,69 @@ class App(Gtk.Application):
             circle.set_tooltip_text("\n".join(lines))
             circle.connect("clicked", self.on_circle_clicked)
             self.circles.append(circle)
-            cap = Gtk.Label(label=display_desc([o[3] for o in circle.occ]) or "–", max_width_chars=16, ellipsize=3,
-                            xalign=0, hexpand=True)
+            vb.circle = circle
+            cap = Gtk.Label(label=display_desc([o[3] for o in circle.occ]) or "–",
+                            max_width_chars=10 if compact else 16,
+                            ellipsize=0 if compact else 3, wrap=compact,
+                            xalign=0.5 if compact else 0, hexpand=not compact)
+            if compact:  # side-by-side captions wrap onto two lines instead of being cut off
+                cap.set_wrap_mode(Pango.WrapMode.WORD_CHAR)
+                cap.set_justify(Gtk.Justification.CENTER)
             cap.add_css_class("caption")
             vb.append(circle)
             vb.append(cap)
             return vb
+
+        def fork_widget(i, count, mode):
+            """Side-by-side segments with arrows down into (or out of) one common segment."""
+            grp = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+            grp.add_css_class("seg-group")  # no "×N" title: the arrows already show the repeat
+            if mode == "in":
+                common = item(i + 1, [i + 1 + 2 * j for j in range(count)])
+                others = [i + 2 * j for j in range(count)]
+            else:
+                common = item(i, [i + 2 * j for j in range(count)])
+                others = [i + 1 + 2 * j for j in range(count)]
+            row = Gtk.Box(spacing=26, halign=Gtk.Align.START)
+            cells = []
+            for j in others:
+                cell = item(j, [j], compact=True)
+                # straight "↓" between each side-by-side segment and the common one
+                down = Gtk.Label(label="↓", halign=Gtk.Align.CENTER)
+                if mode == "in":
+                    cell.append(down)
+                else:
+                    cell.prepend(down)
+                cells.append(cell)
+                row.append(cell)
+            if mode == "in":
+                grp.append(row)
+                grp.append(common)
+            else:
+                grp.append(common)
+                grp.append(row)
+            # angled arrows for the way back:
+            #  "in":  P1 -> B -> P2 -> B ...   B points back up to the *next* P
+            #  "out": B -> P1 -> B -> P2 ...   each P (except the last) points back up to B
+            layer = ArrowLayer()
+            for n in range(count - 1):
+                if mode == "in":
+                    layer.edges.append((common.circle, cells[n + 1].circle))
+                else:
+                    layer.edges.append((cells[n].circle, common.circle))
+            overlay = Gtk.Overlay(child=grp)
+            overlay.add_overlay(layer)
+            grp = overlay
+            return grp
 
         for n, node in enumerate(find_structure(tokens)):
             if n:
                 self.diagram_box.append(arrow())
             if node[0] == "seg":
                 self.diagram_box.append(item(node[1], [node[1]]))
+                continue
+            if node[0] == "fork":
+                self.diagram_box.append(fork_widget(*node[1:]))
                 continue
             _, i, length, count = node
             grp = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
@@ -961,20 +1132,28 @@ class App(Gtk.Application):
         row = self.seg_list.get_row_at_y(int(y))
         if row is None:
             return
-        self.win.set_focus(None)  # leave any description box so shortcuts work again
-        sid = row.seg[0]
         shift = gesture.get_current_event_state() & Gdk.ModifierType.SHIFT_MASK
+        self.select_segment(row.seg[0], bool(shift))
+
+    def select_segment(self, sid, extend=False):
+        """Select a segment (extend=True: everything from the anchor to it) and load its range."""
+        self.win.set_focus(None)  # leave any description box so shortcuts work again
+        i = self.seg_index(sid)
+        if i is None:
+            return
         anchor = self.seg_index(self.pick_anchor) if self.pick_anchor is not None else None
-        if shift and anchor is not None:
-            i0, i1 = sorted((anchor, self.seg_index(sid)))
+        if extend and anchor is not None:
+            i0, i1 = sorted((anchor, i))
             self.start, self.end = self.segments[i0][1], self.segments[i1][2]
             self.pick = (self.segments[i0][0], self.segments[i1][0])
             self.seek(self.start, user=True)
         else:
             self.pick_anchor = sid
-            self.load_segment(row.seg)
+            self.load_segment(self.segments[i][:3])
             self.pick = (sid, sid)
         self.apply_pick()
+        if i < len(self.seg_rows):
+            self.scroll_row_into_view(self.seg_rows[i])
 
     def apply_pick(self):
         r = self.pick_range()
@@ -1045,6 +1224,13 @@ class App(Gtk.Application):
         self.segdb.delete(seg[0])
         self.reload_segments()
 
+    def on_close_request(self, win):
+        maximized = win.is_maximized()
+        if not maximized:  # keep the previous normal size while maximized
+            self.win_size = (win.get_width(), win.get_height())
+        save_window_state(*self.win_size, maximized)
+        return False
+
     # -- media callbacks ---------------------------------------------------
     def on_prepared(self):
         self.duration = self.media.duration
@@ -1065,21 +1251,13 @@ class App(Gtk.Application):
         if (self.playing_selection and self.media.playing
                 and GLib.get_monotonic_time() > self.ignore_until
                 and self.end is not None and self.position >= self.end):
-            if self.loop_chk.get_active():
-                self.seek(self.start)
-            else:
-                self.media.pause()
-                self.playing_selection = False
-                self.seek(self.end)
+            self.seek(self.start)  # playing a selection always loops
         self.refresh()
 
     def on_ended(self):
         if self.playing_selection:
-            if self.loop_chk.get_active():
-                self.seek(self.start)
-                self.media.play()
-            else:
-                self.playing_selection = False
+            self.seek(self.start)
+            self.media.play()
 
     # -- actions -----------------------------------------------------------
     def refresh(self):
@@ -1184,8 +1362,6 @@ class App(Gtk.Application):
             self.set_end()
         elif k in (Gdk.KEY_p, Gdk.KEY_P, Gdk.KEY_Return, Gdk.KEY_KP_Enter):
             self.play_selection()
-        elif k in (Gdk.KEY_l, Gdk.KEY_L):
-            self.loop_chk.set_active(not self.loop_chk.get_active())
         elif k == Gdk.KEY_Home:
             self.goto_start()
         elif k == Gdk.KEY_End:

@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Video Inspect
+Comment=Replay and annotate parts of a video
+Exec=python3 /home/jeroen/scripts/video-inspect/video_inspect.py %f
+Icon=nl.local.VideoInspect
+Terminal=false
+Categories=AudioVideo;Video;
+MimeType=video/mp4;
+StartupNotify=true
