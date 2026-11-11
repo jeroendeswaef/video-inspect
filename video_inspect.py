@@ -265,6 +265,127 @@ class ArrowLayer(Gtk.Widget):
             snap.append_fill(hb.to_path(), Gsk.FillRule.WINDING, col)
 
 
+class SnakeBox(Gtk.Widget):
+    """Lays its children out in a sequence that "snakes" through as many columns as needed.
+
+    The first column runs top to bottom (arrows pointing down). When the next child no
+    longer fits in the available height, a new column is started, which runs bottom to
+    top (arrows pointing up), then the next one top to bottom again, and so on. Between
+    columns a small "→" arrow links the last child of one to the first of the next.
+    """
+    GAP = 30
+
+    def __init__(self):
+        super().__init__()
+        self.nodes, self.arrows = [], []
+        self._height = 0
+        self._total = 0
+
+    def set_nodes(self, nodes):
+        for c in self.nodes + self.arrows:
+            c.unparent()
+        self.nodes = list(nodes)
+        self.arrows = [Gtk.Label() for _ in self.nodes[1:]]
+        for c in self.nodes + self.arrows:
+            c.set_parent(self)
+        self.queue_resize()
+
+    def do_dispose(self):
+        for c in self.nodes + self.arrows:
+            c.unparent()
+        self.nodes, self.arrows = [], []
+
+    def _sizes(self):
+        H, V = Gtk.Orientation.HORIZONTAL, Gtk.Orientation.VERTICAL
+        colw = max((n.measure(H, -1)[1] for n in self.nodes), default=0)
+        nh = [n.measure(V, colw)[1] for n in self.nodes]
+        ah = aw = 0
+        if self.arrows:
+            self.arrows[0].set_text("↓")
+            ah = self.arrows[0].measure(V, -1)[1]
+            aw = self.arrows[0].measure(H, -1)[1]
+        return colw, nh, ah, aw
+
+    @staticmethod
+    def _layout(height, nh, ah):
+        """Return (columns, tops): the child indices per column and every child's y position.
+
+        Column 0 runs down from the top, column 1 runs up, column 2 down again, ... A new
+        column starts when the next child doesn't fit, and its first child is vertically
+        centred on the last child of the previous column (where the "→" link is drawn).
+        """
+        cols, tops = [[]], {}
+        for i, h in enumerate(nh):
+            col = cols[-1]
+            if col:
+                prev, c = col[-1], len(cols) - 1
+                if c % 2 == 0:
+                    top = tops[prev] + nh[prev] + ah
+                    fits = top + h <= height
+                else:
+                    top = tops[prev] - ah - h
+                    fits = top >= 0
+                if fits:
+                    tops[i] = top
+                    col.append(i)
+                    continue
+                top = tops[prev] + nh[prev] / 2 - h / 2
+                cols.append([])
+                col = cols[-1]
+            else:
+                top = 0
+            tops[i] = max(0, min(top, height - h))
+            col.append(i)
+        return cols, tops
+
+    def _total_width(self, height):
+        colw, nh, ah, _aw = self._sizes()
+        cols, _tops = self._layout(max(height, max(nh)), nh, ah)
+        return len(cols) * colw + (len(cols) - 1) * self.GAP
+
+    def do_measure(self, orientation, for_size):
+        if not self.nodes:
+            return 0, 0, -1, -1
+        if orientation == Gtk.Orientation.VERTICAL:
+            colw, nh, _ah, _aw = self._sizes()
+            h = max(nh)  # the tallest single child; extra columns are used before this
+            return h, h, -1, -1
+        w = self._total_width(self._height)
+        return w, w, -1, -1
+
+    def do_size_allocate(self, width, height, baseline):
+        if not self.nodes:
+            return
+        self._height = height
+        colw, nh, ah, aw = self._sizes()
+        H = max(height, max(nh))
+        cols, tops = self._layout(H, nh, ah)
+        total = len(cols) * colw + (len(cols) - 1) * self.GAP
+        if total != self._total:  # number of columns changed: ask the parent for more/less width
+            self._total = total
+            GLib.idle_add(lambda: self.queue_resize() or False)
+
+        def place(widget, x, y, w, h):
+            r = Gdk.Rectangle()
+            r.x, r.y, r.width, r.height = int(x), int(y), int(w), int(h)
+            widget.size_allocate(r, -1)
+
+        for c, col in enumerate(cols):
+            x, down = c * (colw + self.GAP), c % 2 == 0
+            for k, i in enumerate(col):
+                place(self.nodes[i], x, tops[i], colw, nh[i])
+                if i >= len(self.arrows):
+                    continue
+                label = self.arrows[i]
+                if k < len(col) - 1:      # arrow to the next child in the same column
+                    label.set_text("↓" if down else "↑")
+                    ay = tops[i] + nh[i] if down else tops[i] - ah
+                    place(label, x + 14, ay, aw, ah)
+                else:  # link to the next column: vertically centred on this column's last child
+                    label.set_text("→")
+                    place(label, x + colw + (self.GAP - aw) / 2, tops[i] + nh[i] / 2 - ah / 2, aw, ah)
+
+
 class Timeline(Gtk.Widget):
     """Seekable timeline that also shows the start/end markers."""
 
@@ -585,6 +706,9 @@ class App(Gtk.Application):
             + "".join(f"row.seg-row.rc{i} {{ background-color: alpha({c}, 0.6); }}"
                       for i, c in enumerate(DIAGRAM_COLORS)) +
             "row.seg-row { border-bottom: 1px solid white; }"
+            "row.gap-row { margin: 2px 4px; padding: 3px 8px; border: 1px dashed alpha(currentColor, 0.4);"
+            " border-radius: 6px; opacity: 0.65; font-size: 0.9em; }"
+            "row.gap-row:hover { opacity: 1; background-color: alpha(currentColor, 0.08); }"
             "row.seg-row.picked { border-right: 5px solid #1e88e5; }"
             "row.seg-row.current { box-shadow: inset 5px 0 0 #e53935;"
             " background-image: linear-gradient(rgba(229,57,53,0.22), rgba(229,57,53,0.22)); }"
@@ -679,19 +803,17 @@ class App(Gtk.Application):
         box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
         for m in ("top", "bottom", "start", "end"):
             getattr(box, f"set_margin_{m}")(8)
-        box.append(frame)
+        # Top row: video | sequence diagram. The timeline and controls sit below it and span
+        # the full width, so a wider diagram only makes the video narrower.
+        top = Gtk.Box(spacing=8, vexpand=True)
+        frame.set_hexpand(True)
+        top.append(frame)
+        top.append(self.build_diagram())
+        box.append(top)
         box.append(self.timeline)
         box.append(info)
         box.append(controls)
-
-        # video | sequence diagram | segment list
-        inner = Gtk.Paned(orientation=Gtk.Orientation.HORIZONTAL)
-        inner.set_start_child(box)
-        inner.set_resize_start_child(True)
-        inner.set_shrink_start_child(False)
-        inner.set_end_child(self.build_diagram())
-        inner.set_resize_end_child(False)
-        inner.set_shrink_end_child(False)
+        inner = box
 
         paned = Gtk.Paned(orientation=Gtk.Orientation.HORIZONTAL)
         paned.set_start_child(inner)
@@ -770,12 +892,12 @@ class App(Gtk.Application):
 
     # -- sequence diagram --------------------------------------------------
     def build_diagram(self):
-        self.diagram_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4,
-                                   halign=Gtk.Align.START)
+        self.diagram_box = SnakeBox()
         for m in ("top", "bottom", "start", "end"):
             getattr(self.diagram_box, f"set_margin_{m}")(8)
         sw = Gtk.ScrolledWindow(child=self.diagram_box)
         sw.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
+        sw.set_propagate_natural_width(True)  # extra columns make the diagram wider
         sw.set_overlay_scrolling(False)  # keep the scrollbar visible when it overflows
         self.diagram_sw = sw
 
@@ -789,9 +911,8 @@ class App(Gtk.Application):
 
     def rebuild_diagram(self):
         self._diagram_timer = 0
-        while (c := self.diagram_box.get_first_child()) is not None:
-            self.diagram_box.remove(c)
         self.circles = []
+        nodes = []
         segs = self.segments
         tokens = [norm_desc(d) for _, _, _, d in segs]
         color_of = {}
@@ -880,13 +1001,11 @@ class App(Gtk.Application):
             return grp
 
         for n, node in enumerate(find_structure(tokens)):
-            if n:
-                self.diagram_box.append(arrow())
             if node[0] == "seg":
-                self.diagram_box.append(item(node[1], [node[1]]))
+                nodes.append(item(node[1], [node[1]]))
                 continue
             if node[0] == "fork":
-                self.diagram_box.append(fork_widget(*node[1:]))
+                nodes.append(fork_widget(*node[1:]))
                 continue
             _, i, length, count = node
             grp = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
@@ -900,7 +1019,8 @@ class App(Gtk.Application):
                 inner.append(item(i + j, [i + r * length + j for r in range(count)]))
             grp.append(title)
             grp.append(inner)
-            self.diagram_box.append(grp)
+            nodes.append(grp)
+        self.diagram_box.set_nodes(nodes)  # arrows between them (↓ ↑ →) are added by the SnakeBox
         self._active_id = None
         self.update_active()
         self.recolor_rows()
@@ -958,6 +1078,9 @@ class App(Gtk.Application):
         adj = sw.get_vadjustment()
         if r.get_y() < adj.get_value() or r.get_y() + r.get_height() > adj.get_value() + adj.get_page_size():
             adj.set_value(max(0, r.get_y() - 20))
+        adj = sw.get_hadjustment()
+        if r.get_x() < adj.get_value() or r.get_x() + r.get_width() > adj.get_value() + adj.get_page_size():
+            adj.set_value(max(0, r.get_x() - 20))
 
     def reload_segments(self, select_id=None, focus=False):
         self._conflict_key = None
@@ -967,16 +1090,46 @@ class App(Gtk.Application):
         self.timeline.queue_draw()
         while (row := self.seg_list.get_first_child()) is not None:
             self.seg_list.remove(row)
+        # Segment rows, with a clickable "gap" row wherever time is not covered by a segment
+        # (before the first one, between two, and after the last one).
+        min_gap = FRAME_US // 2
+        covered = 0
         for sid, a, b, desc in self.segments:
+            if a - covered > min_gap:
+                self.seg_list.append(self.make_gap_row(covered, a))
             row = self.make_segment_row(sid, a, b, desc)
             self.seg_list.append(row)
             self.seg_rows.append(row)
+            covered = max(covered, b)
             if sid == select_id and focus:
                 row.entry.grab_focus()
+        if self.duration and self.duration - covered > min_gap:
+            self.seg_list.append(self.make_gap_row(covered, self.duration))
         self.recolor_rows()
         self._active_id = None
         self.update_active()
         self.apply_pick()
+
+    def make_gap_row(self, a, b):
+        row = Gtk.ListBoxRow(activatable=False)
+        row.add_css_class("gap-row")
+        row.gap = (a, b)
+        label = Gtk.Label(label=f"＋ gap  {fmt(a)} – {fmt(b)}  ({(b - a) / SEC:.2f}s)", xalign=0)
+        label.add_css_class("monospace")
+        row.set_child(label)
+        row.set_tooltip_text("Click to add a segment that fills this gap")
+        return row
+
+    def fill_gap(self, a, b):
+        """Add a segment covering exactly [a, b] and put the cursor in its description."""
+        if self.segdb.find_overlap(a, b) is not None:
+            return
+        sid = self.segdb.add(a, b)
+        self.start, self.end = a, b
+        self.pick = self.pick_anchor = None
+        self.seek(a, user=True)
+        self.pick, self.pick_anchor = (sid, sid), sid
+        self.reload_segments(select_id=sid, focus=True)
 
     def make_segment_row(self, sid, a, b, desc):
         row = Gtk.ListBoxRow()
@@ -1132,6 +1285,16 @@ class App(Gtk.Application):
         row = self.seg_list.get_row_at_y(int(y))
         if row is None:
             return
+        if getattr(row, "gap", None):
+            self.fill_gap(*row.gap)
+            return
+        # Clicks on a row's own buttons (▶ ⟲ 🗑) or its description box belong to them:
+        # selecting the row here would e.g. reset the markers before ⟲ could use them.
+        w = self.seg_list.pick(x, y, Gtk.PickFlags.DEFAULT)
+        while w is not None and w is not self.seg_list:
+            if isinstance(w, (Gtk.Button, Gtk.Editable)):
+                return
+            w = w.get_parent()
         shift = gesture.get_current_event_state() & Gdk.ModifierType.SHIFT_MASK
         self.select_segment(row.seg[0], bool(shift))
 
@@ -1234,6 +1397,8 @@ class App(Gtk.Application):
     # -- media callbacks ---------------------------------------------------
     def on_prepared(self):
         self.duration = self.media.duration
+        if hasattr(self, "segdb"):
+            self.reload_segments()  # now the gap after the last segment is known
         self.refresh()
 
     def on_frame(self):
