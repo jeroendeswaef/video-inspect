@@ -199,10 +199,22 @@ class Timeline(Gtk.Widget):
         drag.connect("drag-update", self.on_update)
         self._drag_x0 = 0
         self.add_controller(drag)
+        self.set_has_tooltip(True)
+        self.connect("query-tooltip", self.on_tooltip)
 
     def _pos_from_x(self, x):
         w = max(1, self.get_width())
         return int(min(1.0, max(0.0, x / w)) * self.app.duration)
+
+    def on_tooltip(self, widget, x, y, keyboard, tooltip):
+        if not (4 <= y <= 14):
+            return False
+        t = self._pos_from_x(x)
+        for _, a, b, desc in self.app.segments:
+            if a <= t < b:
+                tooltip.set_text(f"{fmt(a)} – {fmt(b)}\n{desc}" if desc else f"{fmt(a)} – {fmt(b)}")
+                return True
+        return False
 
     def on_begin(self, gesture, x, y):
         self._drag_x0 = x
@@ -226,6 +238,11 @@ class Timeline(Gtk.Widget):
         fg = self.get_color()
         rect(0, ty, w, th, (fg.red, fg.green, fg.blue, 0.15))
 
+        # stored segments: a lane above the track, alternating colours
+        for i, (_, sa, sb, _d) in enumerate(self.app.segments):
+            col = (0.55, 0.35, 0.85, 0.9) if i % 2 == 0 else (0.85, 0.55, 0.25, 0.9)
+            rect(sa / dur * w, 4, max((sb - sa) / dur * w - 1, 1), 10, col)
+
         a, b = self.app.start, self.app.end
         if a is not None and b is not None and b > a:
             rect(a / dur * w, ty, (b - a) / dur * w, th, (0.2, 0.6, 1.0, 0.45))
@@ -244,7 +261,28 @@ class SegmentDB:
             'id INTEGER PRIMARY KEY AUTOINCREMENT, '
             'start INTEGER NOT NULL, "end" INTEGER NOT NULL, '
             "description TEXT NOT NULL DEFAULT '')")
+        # Enforce "segments never overlap" in the database itself. Boundaries are
+        # exclusive: a segment may start at the exact time another one ends (touching is ok).
+        # (Triggers are recreated so rule changes also apply to existing databases.)
+        for name, event, other in (
+                ("segments_no_overlap_insert", "INSERT", ""),
+                ("segments_no_overlap_update", 'UPDATE OF start, "end"', "AND id != NEW.id")):
+            self.db.execute(f"DROP TRIGGER IF EXISTS {name}")
+            self.db.execute(
+                f"CREATE TRIGGER {name} BEFORE {event} ON segments BEGIN "
+                'SELECT CASE '
+                'WHEN NEW."end" <= NEW.start THEN RAISE(ABORT, \'segment end must be after start\') '
+                f'WHEN EXISTS (SELECT 1 FROM segments WHERE start < NEW."end" AND "end" > NEW.start {other}) '
+                "THEN RAISE(ABORT, 'segment overlaps an existing segment') "
+                "END; END")
         self.db.commit()
+
+    def find_overlap(self, start, end, exclude_id=None):
+        """First existing segment (id, start, end, description) overlapping [start, end)."""
+        return self.db.execute(
+            'SELECT id, start, "end", description FROM segments '
+            'WHERE start < ? AND "end" > ? AND id IS NOT ? ORDER BY start LIMIT 1',
+            (int(end), int(start), exclude_id)).fetchone()
 
     def all(self):
         return self.db.execute(
@@ -282,6 +320,7 @@ class App(Gtk.Application):
         self.end = None
         self.position = 0
         self.playing_selection = False
+        self.segments = []
         self.ignore_until = 0  # monotonic time (us) until which we ignore end checks
 
     # -- application lifecycle --------------------------------------------
@@ -411,6 +450,10 @@ class App(Gtk.Application):
         self.add_btn.set_tooltip_text("A  (needs a start and an end marker)")
         self.add_btn.connect("clicked", lambda *_: self.add_segment())
 
+        self.seg_status = Gtk.Label(label="", xalign=0, wrap=True)
+        self.seg_status.add_css_class("error")
+        self._conflict_key = None
+
         panel = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
         panel.set_size_request(340, -1)
         for m in ("top", "bottom", "start", "end"):
@@ -418,13 +461,34 @@ class App(Gtk.Application):
         panel.append(title)
         panel.append(dbl)
         panel.append(frame)
+        panel.append(self.seg_status)
         panel.append(self.add_btn)
         return panel
 
+    def conflict_message(self, exclude_id=None):
+        """Why the current markers can't be stored as a segment, or None if they can."""
+        if not self.can_add():
+            return None
+        o = self.segdb.find_overlap(self.start, self.end, exclude_id)
+        if o is None:
+            return None
+        return f"Markers overlap an existing segment ({fmt(o[1])} – {fmt(o[2])})"
+
+    def update_add_state(self):
+        key = (self.start, self.end)
+        if key != self._conflict_key:
+            self._conflict_key = key
+            self._conflict = self.conflict_message()
+            self.seg_status.set_text(self._conflict or "")
+        self.add_btn.set_sensitive(self.can_add() and not self._conflict)
+
     def reload_segments(self, select_id=None, focus=False):
+        self._conflict_key = None
+        self.segments = self.segdb.all()
+        self.timeline.queue_draw()
         while (row := self.seg_list.get_first_child()) is not None:
             self.seg_list.remove(row)
-        for sid, a, b, desc in self.segdb.all():
+        for sid, a, b, desc in self.segments:
             row = self.make_segment_row(sid, a, b, desc)
             self.seg_list.append(row)
             if sid == select_id:
@@ -459,7 +523,7 @@ class App(Gtk.Application):
 
         entry = Gtk.Entry(text=desc, placeholder_text="(no description)")
         entry.add_css_class("seg-entry")
-        entry.connect("changed", lambda e: self.segdb.set_description(sid, e.get_text()))
+        entry.connect("changed", lambda e: self.on_description_changed(sid, e.get_text()))
         entry.connect("activate", lambda e: self.win.set_focus(None))
         row.entry = entry
 
@@ -485,6 +549,10 @@ class App(Gtk.Application):
         row.set_child(vb)
         return row
 
+    def on_description_changed(self, sid, text):
+        self.segdb.set_description(sid, text)
+        self.segments = [(i, a, b, text if i == sid else d) for i, a, b, d in self.segments]
+
     def load_segment(self, seg):
         _, a, b = seg
         self.start, self.end = a, b
@@ -501,15 +569,27 @@ class App(Gtk.Application):
         return self.start is not None and self.end is not None and self.end > self.start
 
     def add_segment(self):
-        if not self.can_add():
+        if not self.can_add() or self.conflict_message():
             return
-        sid = self.segdb.add(self.start, self.end)
+        try:
+            sid = self.segdb.add(self.start, self.end)
+        except sqlite3.IntegrityError as e:
+            self.seg_status.set_text(str(e))
+            return
         self.reload_segments(select_id=sid, focus=True)
 
     def replace_segment(self, seg):
         if not self.can_add():
             return
-        self.segdb.set_times(seg[0], self.start, self.end)
+        msg = self.conflict_message(exclude_id=seg[0])
+        if msg:
+            self.seg_status.set_text(msg)
+            return
+        try:
+            self.segdb.set_times(seg[0], self.start, self.end)
+        except sqlite3.IntegrityError as e:
+            self.seg_status.set_text(str(e))
+            return
         self.reload_segments(select_id=seg[0])
 
     def delete_segment(self, seg):
@@ -563,7 +643,7 @@ class App(Gtk.Application):
             extra = f"  len {fmt(self.end - self.start)}"
         self.sel_label.set_text(f"start {s}   end {e}{extra}")
         self.play_btn.set_label("⏸ Pause" if self.media.playing else "▶ Play")
-        self.add_btn.set_sensitive(self.can_add())
+        self.update_add_state()
         self.timeline.queue_draw()
 
     def on_speed_selected(self, dd, _p):
