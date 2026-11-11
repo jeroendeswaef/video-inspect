@@ -47,6 +47,12 @@ def fmt(us):
     return f"{m:02d}:{s:02d}.{rem // 1000:03d}"
 
 
+DIAGRAM_COLORS = ["#7e57c2", "#ef8a3c", "#26a69a", "#5c8de0", "#d6568a",
+                  "#8bb23a", "#b5882b", "#4f6d7a"]
+def hex_rgb(h):
+    return tuple(int(h[i:i + 2], 16) / 255 for i in (1, 3, 5))
+
+
 SPEEDS = [0.1, 0.25, 0.5, 0.75, 1.0, 1.5, 2.0]
 
 
@@ -238,9 +244,10 @@ class Timeline(Gtk.Widget):
         fg = self.get_color()
         rect(0, ty, w, th, (fg.red, fg.green, fg.blue, 0.15))
 
-        # stored segments: a lane above the track, alternating colours
-        for i, (_, sa, sb, _d) in enumerate(self.app.segments):
-            col = (0.55, 0.35, 0.85, 0.9) if i % 2 == 0 else (0.85, 0.55, 0.25, 0.9)
+        # stored segments: a lane above the track, coloured by description
+        for _, sa, sb, sd in self.app.segments:
+            idx = self.app.color_of.get(norm_desc(sd))
+            col = (*hex_rgb(DIAGRAM_COLORS[idx]), 0.95) if idx is not None else (0.5, 0.5, 0.5, 0.8)
             rect(sa / dur * w, 4, max((sb - sa) / dur * w - 1, 1), 10, col)
 
         a, b = self.app.start, self.app.end
@@ -250,6 +257,41 @@ class Timeline(Gtk.Widget):
             if m is not None:
                 rect(m / dur * w - 1.5, 2, 3, h - 4, col)
         rect(self.app.position / dur * w - 1, 0, 2, h, (0.95, 0.15, 0.15, 1))
+
+
+def norm_desc(desc):
+    d = (desc or "").strip().lower()
+    return d or None
+
+
+def find_structure(tokens):
+    """Split a token sequence into single segments and repeated series.
+
+    Returns ("seg", i) or ("group", i, length, count) nodes: a group is
+    tokens[i:i+length] repeated `count` (>= 2) times back to back. At each
+    position the repetition covering the most segments wins (shorter pattern
+    on ties). Segments without a description (None) never form a repetition.
+    """
+    n, out, i = len(tokens), [], 0
+    while i < n:
+        best = None
+        if tokens[i] is not None:
+            for length in range(1, (n - i) // 2 + 1):
+                pat = tokens[i:i + length]
+                if None in pat:
+                    break
+                k = 1
+                while tokens[i + k * length:i + (k + 1) * length] == pat:
+                    k += 1
+                if k >= 2 and (best is None or length * k > best[0] * best[1]):
+                    best = (length, k)
+        if best:
+            out.append(("group", i, best[0], best[1]))
+            i += best[0] * best[1]
+        else:
+            out.append(("seg", i))
+            i += 1
+    return out
 
 
 class SegmentDB:
@@ -348,11 +390,25 @@ class App(Gtk.Application):
             "entry.seg-entry { background: none; border: none; box-shadow: none; outline: none;"
             " min-height: 0; padding: 2px 2px; }"
             "entry.seg-entry:focus-within { background: alpha(currentColor, 0.08); }"
-            "row button.flat { min-height: 0; min-width: 0; padding: 0 6px; }")
+            "row button.flat { min-height: 0; min-width: 0; padding: 0 6px; }"
+            "button.seg-circle { border-radius: 999px; min-width: 38px; min-height: 38px; padding: 0;"
+            " color: white; font-weight: bold; border: none; box-shadow: none; background-image: none; }"
+            "button.seg-circle.active { box-shadow: 0 0 0 3px #e53935; }"
+            + "".join(f"button.seg-circle.c{i} {{ background-color: {c}; }}"
+                      for i, c in enumerate(DIAGRAM_COLORS))
+            + "".join(f"row.seg-row.rc{i} {{ background-color: alpha({c}, 0.6); }}"
+                      for i, c in enumerate(DIAGRAM_COLORS)) +
+            "row.seg-row { border-bottom: 1px solid white; }"
+            "row.seg-row.current { box-shadow: inset 5px 0 0 #e53935;"
+            " background-image: linear-gradient(rgba(229,57,53,0.22), rgba(229,57,53,0.22)); }"
+            "row.seg-row.current entry.seg-entry { font-weight: bold; }"
+            "box.seg-group { border: 2px solid alpha(currentColor, 0.35); border-radius: 16px;"
+            " padding: 2px 8px 4px 8px; }"
+            "label.seg-group-title { font-weight: bold; opacity: 0.7; }")
         Gtk.StyleContext.add_provider_for_display(
             Gdk.Display.get_default(), css, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
         self.win = Gtk.ApplicationWindow(application=self, title="Video Inspect")
-        self.win.set_default_size(1450, 760)
+        self.win.set_default_size(1650, 760)
 
         self.media = Player(self.path.get_uri(), self.on_frame, self.on_ended,
                             lambda m: print("media error:", m, file=sys.stderr),
@@ -411,8 +467,17 @@ class App(Gtk.Application):
         box.append(info)
         box.append(controls)
 
+        # video | sequence diagram | segment list
+        inner = Gtk.Paned(orientation=Gtk.Orientation.HORIZONTAL)
+        inner.set_start_child(box)
+        inner.set_resize_start_child(True)
+        inner.set_shrink_start_child(False)
+        inner.set_end_child(self.build_diagram())
+        inner.set_resize_end_child(False)
+        inner.set_shrink_end_child(False)
+
         paned = Gtk.Paned(orientation=Gtk.Orientation.HORIZONTAL)
-        paned.set_start_child(box)
+        paned.set_start_child(inner)
         paned.set_resize_start_child(True)
         paned.set_shrink_start_child(False)
         paned.set_end_child(self.build_segment_panel())
@@ -440,9 +505,11 @@ class App(Gtk.Application):
         dbl.add_css_class("dim-label")
         dbl.set_ellipsize(3)
         self.seg_list = Gtk.ListBox()
-        self.seg_list.set_selection_mode(Gtk.SelectionMode.SINGLE)
+        self.seg_list.set_selection_mode(Gtk.SelectionMode.NONE)
+        self.seg_rows = []
         self.seg_list.connect("row-activated", self.on_segment_activated)
-        sw = Gtk.ScrolledWindow(child=self.seg_list, vexpand=True)
+        sw = self.seg_sw = Gtk.ScrolledWindow(child=self.seg_list, vexpand=True)
+        sw.set_overlay_scrolling(False)
         sw.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
         frame = Gtk.Frame(child=sw)
         frame.set_vexpand(True)
@@ -479,25 +546,167 @@ class App(Gtk.Application):
         if key != self._conflict_key:
             self._conflict_key = key
             self._conflict = self.conflict_message()
-            self.seg_status.set_text(self._conflict or "")
+            self.seg_status.set_text("")  # errors only appear after a failed attempt
+            self.add_btn.set_tooltip_text(
+                self._conflict or "A  (needs a start and an end marker)")
         self.add_btn.set_sensitive(self.can_add() and not self._conflict)
+
+    # -- sequence diagram --------------------------------------------------
+    def build_diagram(self):
+        self.diagram_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4,
+                                   halign=Gtk.Align.START)
+        for m in ("top", "bottom", "start", "end"):
+            getattr(self.diagram_box, f"set_margin_{m}")(8)
+        sw = Gtk.ScrolledWindow(child=self.diagram_box)
+        sw.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        sw.set_overlay_scrolling(False)  # keep the scrollbar visible when it overflows
+        self.diagram_sw = sw
+
+        self.circles = []
+        self._active_id = None
+        self.color_of = {}
+        self._diagram_timer = 0
+        frame = Gtk.Frame(child=sw)
+        frame.set_size_request(210, -1)
+        return frame
+
+    def rebuild_diagram(self):
+        self._diagram_timer = 0
+        while (c := self.diagram_box.get_first_child()) is not None:
+            self.diagram_box.remove(c)
+        self.circles = []
+        segs = self.segments
+        tokens = [norm_desc(d) for _, _, _, d in segs]
+        color_of = {}
+        for t in tokens:
+            if t is not None and t not in color_of:
+                color_of[t] = len(color_of) % len(DIAGRAM_COLORS)
+        self.color_of = color_of
+
+        def arrow():
+            return Gtk.Label(label="↓", halign=Gtk.Align.START, margin_start=14)
+
+        def item(i, occ):
+            vb = Gtk.Box(spacing=8)
+            circle = Gtk.Button(label=str(i + 1), valign=Gtk.Align.CENTER)
+            circle.add_css_class("seg-circle")
+            circle.add_css_class(f"c{color_of[tokens[i]]}" if tokens[i] is not None else "c7")
+            circle.occ = [segs[j] for j in occ]
+            lines = [f"{fmt(a)} – {fmt(b)}" + (f"  #{n + 1}" if len(occ) > 1 else "")
+                     for n, (_, a, b, _d) in enumerate(circle.occ)]
+            if segs[i][3]:
+                lines.insert(0, segs[i][3])
+            if len(occ) > 1:
+                lines.append(f"repeats ×{len(occ)} – click to cycle through them")
+            circle.set_tooltip_text("\n".join(lines))
+            circle.connect("clicked", self.on_circle_clicked)
+            self.circles.append(circle)
+            cap = Gtk.Label(label=segs[i][3] or "–", max_width_chars=16, ellipsize=3,
+                            xalign=0, hexpand=True)
+            cap.add_css_class("caption")
+            vb.append(circle)
+            vb.append(cap)
+            return vb
+
+        for n, node in enumerate(find_structure(tokens)):
+            if n:
+                self.diagram_box.append(arrow())
+            if node[0] == "seg":
+                self.diagram_box.append(item(node[1], [node[1]]))
+                continue
+            _, i, length, count = node
+            grp = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+            grp.add_css_class("seg-group")
+            title = Gtk.Label(label=f"↻ ×{count}", xalign=0)
+            title.add_css_class("seg-group-title")
+            inner = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+            for j in range(length):
+                if j:
+                    inner.append(arrow())
+                inner.append(item(i + j, [i + r * length + j for r in range(count)]))
+            grp.append(title)
+            grp.append(inner)
+            self.diagram_box.append(grp)
+        self._active_id = None
+        self.update_active()
+        self.recolor_rows()
+
+    def recolor_rows(self):
+        """Give each segment row the colour of its description (as in the diagram)."""
+        desc = {sid: d for sid, _a, _b, d in self.segments}
+        for row in self.seg_rows:
+            t = norm_desc(desc.get(row.seg[0]))
+            cls = f"rc{self.color_of[t]}" if t in self.color_of else None
+            if cls != row.color_cls:
+                if row.color_cls:
+                    row.remove_css_class(row.color_cls)
+                if cls:
+                    row.add_css_class(cls)
+                row.color_cls = cls
+
+    def schedule_diagram_rebuild(self):
+        if self._diagram_timer:
+            GLib.source_remove(self._diagram_timer)
+        self._diagram_timer = GLib.timeout_add(400, lambda: self.rebuild_diagram() or False)
+
+    def on_circle_clicked(self, circle):
+        ids = [o[0] for o in circle.occ]
+        k = (ids.index(self._active_id) + 1) % len(ids) if self._active_id in ids else 0
+        sid, a, b, _d = circle.occ[k]
+        self.load_segment((sid, a, b))
+
+    def update_active(self):
+        active = next((sid for sid, a, b, _d in self.segments if a <= self.position < b), None)
+        if active == self._active_id:
+            return
+        self._active_id = active
+        for c in self.circles:
+            if any(o[0] == active for o in c.occ):
+                c.add_css_class("active")
+                self.scroll_into_view(c, self.diagram_box, self.diagram_sw)
+            else:
+                c.remove_css_class("active")
+        for row in self.seg_rows:
+            if row.seg[0] == active:
+                row.add_css_class("current")
+                self.scroll_row_into_view(row)
+            else:
+                row.remove_css_class("current")
+
+    def scroll_row_into_view(self, row):
+        self.scroll_into_view(row, self.seg_list, self.seg_sw)
+
+    @staticmethod
+    def scroll_into_view(widget, container, sw):
+        ok, r = widget.compute_bounds(container)
+        if not ok:
+            return
+        adj = sw.get_vadjustment()
+        if r.get_y() < adj.get_value() or r.get_y() + r.get_height() > adj.get_value() + adj.get_page_size():
+            adj.set_value(max(0, r.get_y() - 20))
 
     def reload_segments(self, select_id=None, focus=False):
         self._conflict_key = None
         self.segments = self.segdb.all()
+        self.seg_rows = []
+        self.rebuild_diagram()
         self.timeline.queue_draw()
         while (row := self.seg_list.get_first_child()) is not None:
             self.seg_list.remove(row)
         for sid, a, b, desc in self.segments:
             row = self.make_segment_row(sid, a, b, desc)
             self.seg_list.append(row)
-            if sid == select_id:
-                self.seg_list.select_row(row)
-                if focus:
-                    row.entry.grab_focus()
+            self.seg_rows.append(row)
+            if sid == select_id and focus:
+                row.entry.grab_focus()
+        self.recolor_rows()
+        self._active_id = None
+        self.update_active()
 
     def make_segment_row(self, sid, a, b, desc):
         row = Gtk.ListBoxRow()
+        row.add_css_class("seg-row")
+        row.color_cls = None
         row.seg = (sid, a, b)
 
         times = Gtk.Label(label=f"{fmt(a)} – {fmt(b)}  ({(b - a) / SEC:.2f}s)", xalign=0, hexpand=True)
@@ -552,6 +761,7 @@ class App(Gtk.Application):
     def on_description_changed(self, sid, text):
         self.segdb.set_description(sid, text)
         self.segments = [(i, a, b, text if i == sid else d) for i, a, b, d in self.segments]
+        self.schedule_diagram_rebuild()
 
     def load_segment(self, seg):
         _, a, b = seg
@@ -569,7 +779,11 @@ class App(Gtk.Application):
         return self.start is not None and self.end is not None and self.end > self.start
 
     def add_segment(self):
-        if not self.can_add() or self.conflict_message():
+        if not self.can_add():
+            return
+        msg = self.conflict_message()
+        if msg:
+            self.seg_status.set_text(msg)
             return
         try:
             sid = self.segdb.add(self.start, self.end)
@@ -644,6 +858,7 @@ class App(Gtk.Application):
         self.sel_label.set_text(f"start {s}   end {e}{extra}")
         self.play_btn.set_label("⏸ Pause" if self.media.playing else "▶ Play")
         self.update_add_state()
+        self.update_active()
         self.timeline.queue_draw()
 
     def on_speed_selected(self, dd, _p):
