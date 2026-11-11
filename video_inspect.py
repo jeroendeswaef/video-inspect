@@ -1272,10 +1272,10 @@ class App(Gtk.Application):
             vb.circle = circle
             cap = Gtk.Label(label=display_desc([o[3] for o in circle.occ]) or "–",
                             max_width_chars=10 if compact else 16,
-                            ellipsize=0 if compact else 3, wrap=compact,
+                            ellipsize=0, wrap=True,
                             xalign=0.5 if compact else 0, hexpand=not compact)
-            if compact:  # side-by-side captions wrap onto two lines instead of being cut off
-                cap.set_wrap_mode(Pango.WrapMode.WORD_CHAR)
+            cap.set_wrap_mode(Pango.WrapMode.WORD_CHAR)  # long captions wrap instead of being cut off
+            if compact:
                 cap.set_justify(Gtk.Justification.CENTER)
             cap.add_css_class("caption")
             vb.append(circle)
