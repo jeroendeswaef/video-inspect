@@ -3,8 +3,9 @@
 
 Usage: video_inspect.py VIDEO.mp4
 
-Segments are stored in VIDEO.sqlite next to the video (table "segments":
-id, start, end, description; start/end in microseconds).
+Segments and markers are stored in VIDEO.sqlite next to the video (tables
+"segments": id, start, end, description and "markers": id, time, description;
+times in microseconds).
 
 Keys:
   Space        play / pause
@@ -16,6 +17,7 @@ Keys:
   Home / End   jump to start / end marker
   C            clear markers
   [ / ]        slower / faster playback
+  M            add a marker (bookmark) at the current position (also in the menu)
   A            add a segment from the markers
   (list)       click a segment, Shift+click to select consecutive segments;
                P loops the combined time range
@@ -215,8 +217,22 @@ class Timeline(Gtk.Widget):
         w = max(1, self.get_width())
         return int(min(1.0, max(0.0, x / w)) * self.app.duration)
 
+    def marker_at(self, x, y):
+        """Marker (id, time, description) whose arrow is under (x, y), or None."""
+        if y > 10:
+            return None
+        w, dur = max(1, self.get_width()), self.app.duration or 1
+        for m in self.app.markers:
+            if abs(m[1] / dur * w - x) <= 6:
+                return m
+        return None
+
     def on_tooltip(self, widget, x, y, keyboard, tooltip):
-        if not (4 <= y <= 14):
+        m = self.marker_at(x, y)
+        if m:
+            tooltip.set_text(f"Marker {fmt(m[1])}\n{m[2]}" if m[2] else f"Marker {fmt(m[1])}")
+            return True
+        if not (9 <= y <= 17):
             return False
         t = self._pos_from_x(x)
         for _, a, b, desc in self.app.segments:
@@ -227,9 +243,15 @@ class Timeline(Gtk.Widget):
 
     def on_begin(self, gesture, x, y):
         self._drag_x0 = x
+        self._on_marker = self.marker_at(x, y)
+        if self._on_marker:
+            self.app.open_marker_dialog(self._on_marker)
+            return
         self.app.seek(self._pos_from_x(x), user=True)
 
     def on_update(self, gesture, dx, dy):
+        if getattr(self, "_on_marker", None):
+            return
         self.app.seek(self._pos_from_x(self._drag_x0 + dx), user=True)
 
     def do_snapshot(self, snap):
@@ -251,7 +273,7 @@ class Timeline(Gtk.Widget):
         for _, sa, sb, sd in self.app.segments:
             idx = self.app.color_of.get(norm_desc(sd))
             col = (*hex_rgb(DIAGRAM_COLORS[idx]), 0.95) if idx is not None else (0.5, 0.5, 0.5, 0.8)
-            rect(sa / dur * w, 4, max((sb - sa) / dur * w - 1, 1), 10, col)
+            rect(sa / dur * w, 9, max((sb - sa) / dur * w - 1, 1), 8, col)
 
         a, b = self.app.start, self.app.end
         if a is not None and b is not None and b > a:
@@ -260,6 +282,18 @@ class Timeline(Gtk.Widget):
             if m is not None:
                 rect(m / dur * w - 1.5, 2, 3, h - 4, col)
         rect(self.app.position / dur * w - 1, 0, 2, h, (0.95, 0.15, 0.15, 1))
+
+        # bookmarks: small arrows along the top edge
+        for _, mt, _d in self.app.markers:
+            x = mt / dur * w
+            pb = Gsk.PathBuilder.new()
+            pb.move_to(x - 5, 0)
+            pb.line_to(x + 5, 0)
+            pb.line_to(x, 8)
+            pb.close()
+            c = Gdk.RGBA()
+            c.red, c.green, c.blue, c.alpha = 0.85, 0.15, 0.45, 1
+            snap.append_fill(pb.to_path(), Gsk.FillRule.WINDING, c)
 
 
 def norm_desc(desc):
@@ -319,6 +353,10 @@ class SegmentDB:
             'id INTEGER PRIMARY KEY AUTOINCREMENT, '
             'start INTEGER NOT NULL, "end" INTEGER NOT NULL, '
             "description TEXT NOT NULL DEFAULT '')")
+        self.db.execute(
+            "CREATE TABLE IF NOT EXISTS markers ("
+            "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+            "time INTEGER NOT NULL, description TEXT NOT NULL DEFAULT '')")
         # Enforce "segments never overlap" in the database itself. Boundaries are
         # exclusive: a segment may start at the exact time another one ends (touching is ok).
         # (Triggers are recreated so rule changes also apply to existing databases.)
@@ -333,6 +371,23 @@ class SegmentDB:
                 f'WHEN EXISTS (SELECT 1 FROM segments WHERE start < NEW."end" AND "end" > NEW.start {other}) '
                 "THEN RAISE(ABORT, 'segment overlaps an existing segment') "
                 "END; END")
+        self.db.commit()
+
+    def markers(self):
+        return self.db.execute("SELECT id, time, description FROM markers ORDER BY time, id").fetchall()
+
+    def add_marker(self, time, description=""):
+        cur = self.db.execute("INSERT INTO markers (time, description) VALUES (?, ?)",
+                              (int(time), description))
+        self.db.commit()
+        return cur.lastrowid
+
+    def set_marker_description(self, mid, text):
+        self.db.execute("UPDATE markers SET description=? WHERE id=?", (text, mid))
+        self.db.commit()
+
+    def delete_marker(self, mid):
+        self.db.execute("DELETE FROM markers WHERE id=?", (mid,))
         self.db.commit()
 
     def find_overlap(self, start, end, exclude_id=None):
@@ -379,6 +434,7 @@ class App(Gtk.Application):
         self.position = 0
         self.playing_selection = False
         self.segments = []
+        self.markers = []
         self.ignore_until = 0  # monotonic time (us) until which we ignore end checks
 
     # -- application lifecycle --------------------------------------------
@@ -427,6 +483,16 @@ class App(Gtk.Application):
         self.win = Gtk.ApplicationWindow(application=self, title="Video Inspect")
         self.win.set_default_size(1650, 760)
 
+        header = Gtk.HeaderBar()
+        menu = Gio.Menu()
+        menu.append("Add marker at current position  (M)", "win.add-marker")
+        mb = Gtk.MenuButton(icon_name="open-menu-symbolic", menu_model=menu)
+        header.pack_end(mb)
+        self.win.set_titlebar(header)
+        act = Gio.SimpleAction.new("add-marker", None)
+        act.connect("activate", lambda *_: self.add_marker())
+        self.win.add_action(act)
+
         self.media = Player(self.path.get_uri(), self.on_frame, self.on_ended,
                             lambda m: print("media error:", m, file=sys.stderr),
                             self.on_prepared)
@@ -435,9 +501,10 @@ class App(Gtk.Application):
         frame.set_vexpand(True)
 
         self.timeline = Timeline(self)
-        self.pos_label = Gtk.Label(label="00:00.000 / 00:00.000", xalign=0)
+        # fixed widths so the layout (and window size) don't change while playing
+        self.pos_label = Gtk.Label(label="00:00.000 / 00:00.000", xalign=0, width_chars=36)
         self.pos_label.add_css_class("monospace")
-        self.sel_label = Gtk.Label(label="", xalign=1, hexpand=True)
+        self.sel_label = Gtk.Label(label="", xalign=1, hexpand=True, width_chars=46)
         self.sel_label.add_css_class("monospace")
         info = Gtk.Box(spacing=12)
         info.append(self.pos_label)
@@ -451,30 +518,40 @@ class App(Gtk.Application):
             return b
 
         self.play_btn = btn("▶ Play", self.toggle_play, "Space")
-        controls = Gtk.Box(spacing=6)
-        controls.append(btn("⏮ -1s", lambda: self.seek_rel(-SEC), "Left"))
-        controls.append(btn("◀| frame", lambda: self.seek_rel(-FRAME_US), ","))
-        controls.append(self.play_btn)
-        controls.append(btn("frame |▶", lambda: self.seek_rel(FRAME_US), "."))
-        controls.append(btn("+1s ⏭", lambda: self.seek_rel(SEC), "Right"))
-        controls.append(Gtk.Separator(orientation=Gtk.Orientation.VERTICAL))
-        controls.append(btn("[ Set start", self.set_start, "I"))
-        controls.append(btn("Set end ]", self.set_end, "O"))
-        controls.append(btn("Go to start", self.goto_start, "Home"))
-        controls.append(btn("Go to end", self.goto_end, "End"))
-        controls.append(btn("Clear", self.clear_markers, "C"))
-        controls.append(Gtk.Separator(orientation=Gtk.Orientation.VERTICAL))
-        controls.append(btn("▶ Play selection", self.play_selection, "P / Enter"))
+        def group(*widgets):
+            g = Gtk.Box(spacing=6)
+            for w in widgets:
+                g.append(w)
+            return g
+
         self.loop_chk = Gtk.CheckButton(label="Loop")
         self.loop_chk.set_active(True)
-        controls.append(self.loop_chk)
-        controls.append(Gtk.Separator(orientation=Gtk.Orientation.VERTICAL))
-        controls.append(Gtk.Label(label="Speed"))
         self.speed_dd = Gtk.DropDown.new_from_strings([f"{r:g}x" for r in SPEEDS])
         self.speed_dd.set_selected(SPEEDS.index(1.0))
         self.speed_dd.set_tooltip_text("[ slower, ] faster")
         self.speed_dd.connect("notify::selected", self.on_speed_selected)
-        controls.append(self.speed_dd)
+
+        # The button groups wrap onto extra rows when the video column is narrow,
+        # so the window's minimum width stays small.
+        controls = Gtk.FlowBox(selection_mode=Gtk.SelectionMode.NONE, homogeneous=False,
+                               column_spacing=16, row_spacing=6, max_children_per_line=20)
+        groups = [
+            group(btn("⏮ -1s", lambda: self.seek_rel(-SEC), "Left"),
+                  btn("◀| frame", lambda: self.seek_rel(-FRAME_US), ","),
+                  self.play_btn,
+                  btn("frame |▶", lambda: self.seek_rel(FRAME_US), "."),
+                  btn("+1s ⏭", lambda: self.seek_rel(SEC), "Right")),
+            group(btn("[ Set start", self.set_start, "I"),
+                  btn("Set end ]", self.set_end, "O"),
+                  btn("Go to start", self.goto_start, "Home"),
+                  btn("Go to end", self.goto_end, "End"),
+                  btn("Clear", self.clear_markers, "C")),
+            group(btn("▶ Play selection", self.play_selection, "P / Enter"), self.loop_chk),
+            group(Gtk.Label(label="Speed"), self.speed_dd),
+        ]
+        for i, g in enumerate(groups):
+            controls.append(g)
+            controls.get_child_at_index(i).set_focusable(False)
 
         box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
         for m in ("top", "bottom", "start", "end"):
@@ -515,6 +592,7 @@ class App(Gtk.Application):
     def build_segment_panel(self):
         db_path = os.path.splitext(self.path.get_path())[0] + ".sqlite"
         self.segdb = SegmentDB(db_path)
+        self.markers = self.segdb.markers()
 
         title = Gtk.Label(label="Segments", xalign=0)
         title.add_css_class("heading")
@@ -794,6 +872,76 @@ class App(Gtk.Application):
         self.start, self.end = a, b
         self.seek(a, user=True)
 
+    # -- markers (bookmarks) -------------------------------------------------
+    def add_marker(self):
+        self.open_marker_dialog(None, self.position)
+
+    def open_marker_dialog(self, marker, time=None):
+        """Add a marker at `time` (marker is None) or edit/delete an existing one."""
+        if marker:
+            time = marker[1]
+        dlg = Gtk.Window(transient_for=self.win, modal=True, resizable=False,
+                         title="Edit marker" if marker else "Add marker")
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+        for m in ("top", "bottom", "start", "end"):
+            getattr(box, f"set_margin_{m}")(14)
+        pos = Gtk.Label(label=f"Position {fmt(time)}", xalign=0)
+        pos.add_css_class("monospace")
+        entry = Gtk.Entry(text=marker[2] if marker else "", placeholder_text="description",
+                          width_chars=38)
+
+        def close():
+            dlg.close()
+
+        def save():
+            text = entry.get_text().strip()
+            if marker:
+                self.segdb.set_marker_description(marker[0], text)
+            else:
+                self.segdb.add_marker(time, text)
+            self.reload_markers()
+            close()
+
+        def delete():
+            self.segdb.delete_marker(marker[0])
+            self.reload_markers()
+            close()
+
+        def goto():
+            self.seek(time, user=True)
+            close()
+
+        def button(label, cb, css=None):
+            b = Gtk.Button(label=label)
+            if css:
+                b.add_css_class(css)
+            b.connect("clicked", lambda *_: cb())
+            return b
+
+        row = Gtk.Box(spacing=6)
+        if marker:
+            row.append(button("Delete", delete, "destructive-action"))
+            row.append(button("Go to", goto))
+        row.append(Gtk.Box(hexpand=True))
+        row.append(button("Cancel", close))
+        row.append(button("Save", save, "suggested-action"))
+        box.append(pos)
+        box.append(entry)
+        box.append(row)
+        dlg.set_child(box)
+        entry.connect("activate", lambda *_: save())
+        keys = Gtk.EventControllerKey()
+        keys.connect("key-pressed",
+                     lambda c, kv, kc, st: (close(), True)[1] if kv == Gdk.KEY_Escape else False)
+        dlg.add_controller(keys)
+        dlg.present()
+        entry.grab_focus()
+        self._marker_dialog, self._marker_entry, self._marker_save = dlg, entry, save
+
+    def reload_markers(self):
+        self.markers = self.segdb.markers()
+        self.timeline.queue_draw()
+
     # -- selecting consecutive segments --------------------------------------
     def seg_index(self, sid):
         return next((i for i, sg in enumerate(self.segments) if sg[0] == sid), None)
@@ -1042,6 +1190,8 @@ class App(Gtk.Application):
             self.goto_start()
         elif k == Gdk.KEY_End:
             self.goto_end()
+        elif k in (Gdk.KEY_m, Gdk.KEY_M):
+            self.add_marker()
         elif k in (Gdk.KEY_a, Gdk.KEY_A):
             self.add_segment()
         elif k == Gdk.KEY_bracketleft:
