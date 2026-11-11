@@ -1,7 +1,11 @@
 #!/usr/bin/env python3
 """video-inspect: a small GTK4 video player for replaying parts of a video.
 
-Usage: video_inspect.py VIDEO.mp4
+Usage: video_inspect.py VIDEO.mp4 [--audio CLEAN_AUDIO_FILE]
+
+--audio gives a clean recording of the song heard in the video. It is aligned with the video's
+own sound once (a few seconds, needs ffmpeg + numpy + scipy; see audio_sync.py), remembered in
+the database, and can then be switched on/off in the menu ("Play clean audio track").
 
 Segments and markers are stored in VIDEO.sqlite next to the video (tables
 "segments": id, start, end, description and "markers": id, time, description;
@@ -22,6 +26,7 @@ Keys:
                P loops the combined time range
   R            rotate the video view 90 degrees
 """
+import bisect
 import json
 import math
 import os
@@ -29,6 +34,7 @@ import re
 import sqlite3
 import sys
 import threading
+import time
 
 import gi
 
@@ -86,6 +92,93 @@ def save_window_state(width, height, maximized):
 SPEEDS = [0.1, 0.25, 0.5, 0.75, 0.8, 0.85, 1.0, 1.5, 2.0]
 
 
+def unmute_streams(pipeline):
+    """Make sure our PulseAudio/PipeWire output streams are not muted.
+
+    The sound server remembers mute state per application name ("python3"), so a stream that was
+    ever muted at stream level makes every later stream of ours start out muted. We never mute at
+    stream level any more (see Player.set_clean_audio), and this resets a state saved earlier.
+    """
+    it = pipeline.iterate_recurse()
+    while True:
+        res, element = it.next()
+        if res != Gst.IteratorResult.OK:
+            break
+        if element.get_factory() and element.get_factory().get_name() == "pulsesink":
+            element.set_property("mute", False)
+
+
+class AudioTrack:
+    """A clean audio file (the same song as in the video) played by its own pipeline in sync.
+
+    `anchors` come from audio_sync.compute_anchors: [(video_time_us, offset_us), ...]. From
+    each video_time on, the track position is video position + offset. Playback rate changes use
+    scaletempo, so the pitch stays the same when playing slower or faster.
+    """
+    TOLERANCE_US = 80_000   # re-seek when the *average* error over WINDOW readings exceeds this
+    WINDOW = 15             # readings (one per tick, ~0.5 s): single position queries are noisy
+    GRACE_S = 1.0           # after a (re)start, give the pipeline time before judging its position
+
+    def __init__(self, path, anchors):
+        self.anchors = sorted(anchors)
+        self._starts = [t for t, _o in self.anchors]
+        self.rate = 1.0
+        self.playing = False
+        self._index = 0
+        self._grace_until = 0.0
+        self._errors = []
+        self.pipe = Gst.parse_launch(
+            "uridecodebin name=dec ! audioconvert ! audioresample ! scaletempo ! "
+            "audioconvert ! audioresample ! autoaudiosink")
+        self.pipe.get_by_name("dec").set_property("uri", Gio.File.new_for_path(path).get_uri())
+        self.pipe.set_state(Gst.State.PAUSED)
+        unmute_streams(self.pipe)
+
+    def _index_at(self, video_us):
+        return max(0, bisect.bisect_right(self._starts, video_us) - 1)
+
+    def target(self, video_us):
+        return max(0, int(video_us) + self.anchors[self._index_at(video_us)][1])
+
+    def seek(self, video_us, rate=None):
+        if rate is not None:
+            self.rate = rate
+        self._index = self._index_at(video_us)
+        self._errors = []
+        self._grace_until = time.monotonic() + self.GRACE_S
+        self.pipe.seek(self.rate, Gst.Format.TIME, Gst.SeekFlags.FLUSH | Gst.SeekFlags.ACCURATE,
+                       Gst.SeekType.SET, self.target(video_us) * 1000, Gst.SeekType.NONE, 0)
+
+    def play(self):
+        self.playing = True
+        self.pipe.set_state(Gst.State.PLAYING)
+        unmute_streams(self.pipe)
+
+    def pause(self):
+        self.playing = False
+        self.pipe.set_state(Gst.State.PAUSED)
+
+    def stop(self):
+        self.pipe.set_state(Gst.State.NULL)
+
+    def check(self, video_us):
+        """Keep the track in step with the video; call regularly while playing."""
+        if not self.playing or time.monotonic() < self._grace_until:
+            return
+        if self._index_at(video_us) != self._index:   # crossed a jump in the video's audio
+            self.seek(video_us)
+            return
+        ok, pos = self.pipe.query_position(Gst.Format.TIME)
+        if not ok:
+            return
+        self._errors.append(pos // 1000 - self.target(video_us))
+        if len(self._errors) >= self.WINDOW:
+            mean = sum(self._errors) / len(self._errors)
+            del self._errors[0]
+            if abs(mean) > self.TOLERANCE_US:
+                self.seek(video_us)
+
+
 class Player:
     """GStreamer playbin rendering into an appsink, with variable playback rate."""
 
@@ -112,11 +205,18 @@ class Player:
         sink.connect("new-sample", self._sample, "pull-sample")
         sink.connect("new-preroll", self._sample, "pull-preroll")
         self.pipe.set_property("video-sink", bin_)
+        # The original sound goes through a volume element we can silence inside the pipeline
+        # (muting the output stream itself would be remembered by the sound server).
+        audio_bin = Gst.parse_bin_from_description("volume name=orig_volume ! autoaudiosink", True)
+        self.audio_volume = audio_bin.get_by_name("orig_volume")
+        self.pipe.set_property("audio-sink", audio_bin)
         bus = self.pipe.get_bus()
         bus.add_signal_watch()
         bus.connect("message::eos", self._eos)
         bus.connect("message::error", self._error)
         bus.connect("message::async-done", self._done)
+        self.audio = None   # optional AudioTrack
+        self.clean = False  # True: play the clean track instead of the video's own sound
         self.pipe.set_state(Gst.State.PAUSED)
 
     def _sample(self, sink, which):
@@ -149,6 +249,8 @@ class Player:
         self.ended = True
         self.playing = False
         self.pipe.set_state(Gst.State.PAUSED)
+        if self.clean:
+            self.audio.pause()
         self.on_eos()
 
     def _error(self, bus, msg):
@@ -172,14 +274,36 @@ class Player:
         self.pipe.seek(self.rate, Gst.Format.TIME,
                        Gst.SeekFlags.FLUSH | Gst.SeekFlags.ACCURATE,
                        Gst.SeekType.SET, int(us) * 1000, Gst.SeekType.NONE, 0)
+        if self.clean:
+            self.audio.seek(us, self.rate)
 
     def play(self):
         self.playing = True
         self.pipe.set_state(Gst.State.PLAYING)
+        unmute_streams(self.pipe)
+        if self.clean:
+            self.audio.play()
 
     def pause(self):
         self.playing = False
         self.pipe.set_state(Gst.State.PAUSED)
+        if self.clean:
+            self.audio.pause()
+
+    def set_clean_audio(self, on, position_us=0):
+        """Play the clean track (and silence the video's own sound) or go back to the original."""
+        self.clean = bool(on and self.audio)
+        self.audio_volume.set_property("mute", self.clean)
+        if self.clean:
+            self.audio.seek(position_us, self.rate)
+            if self.playing:
+                self.audio.play()
+        elif self.audio:
+            self.audio.pause()
+
+    def sync_audio(self, position_us):
+        if self.clean:
+            self.audio.check(position_us)
 
     def set_rate(self, rate):
         pos = self.get_position()
@@ -374,6 +498,8 @@ class SnakeBox(Gtk.Widget):
         for c, col in enumerate(cols):
             x, down = c * (colw + self.GAP), c % 2 == 0
             for k, i in enumerate(col):
+                if hasattr(self.nodes[i], "set_up"):
+                    self.nodes[i].set_up(not down)
                 place(self.nodes[i], x, tops[i], colw, nh[i])
                 if i >= len(self.arrows):
                     continue
@@ -675,6 +801,10 @@ class SegmentDB:
             'start INTEGER NOT NULL, "end" INTEGER NOT NULL, '
             "description TEXT NOT NULL DEFAULT '')")
         self.db.execute(
+            "CREATE TABLE IF NOT EXISTS audio_track ("
+            "id INTEGER PRIMARY KEY CHECK (id = 1), path TEXT NOT NULL, size INTEGER NOT NULL, "
+            "mtime REAL NOT NULL, enabled INTEGER NOT NULL DEFAULT 1, anchors TEXT NOT NULL)")
+        self.db.execute(
             "CREATE TABLE IF NOT EXISTS markers ("
             "id INTEGER PRIMARY KEY AUTOINCREMENT, "
             "time INTEGER NOT NULL, description TEXT NOT NULL DEFAULT '')")
@@ -692,6 +822,21 @@ class SegmentDB:
                 f'WHEN EXISTS (SELECT 1 FROM segments WHERE start < NEW."end" AND "end" > NEW.start {other}) '
                 "THEN RAISE(ABORT, 'segment overlaps an existing segment') "
                 "END; END")
+        self.db.commit()
+
+    def get_audio(self):
+        """(path, size, mtime, enabled, anchors) of the clean audio track for this video, or None."""
+        r = self.db.execute("SELECT path, size, mtime, enabled, anchors FROM audio_track WHERE id=1").fetchone()
+        return None if r is None else (r[0], r[1], r[2], bool(r[3]), [tuple(a) for a in json.loads(r[4])])
+
+    def set_audio(self, path, size, mtime, enabled, anchors):
+        self.db.execute(
+            "INSERT OR REPLACE INTO audio_track (id, path, size, mtime, enabled, anchors) "
+            "VALUES (1, ?, ?, ?, ?, ?)", (path, size, mtime, int(enabled), json.dumps(anchors)))
+        self.db.commit()
+
+    def set_audio_enabled(self, enabled):
+        self.db.execute("UPDATE audio_track SET enabled=? WHERE id=1", (int(enabled),))
         self.db.commit()
 
     def markers(self):
@@ -756,15 +901,27 @@ class App(Gtk.Application):
         self.playing_selection = False
         self.segments = []
         self.markers = []
+        self.audio_arg = None
         self.ignore_until = 0  # monotonic time (us) until which we ignore end checks
 
     # -- application lifecycle --------------------------------------------
     def do_command_line(self, cmdline):
         args = cmdline.get_arguments()[1:]
+        audio = None
+        for i, a in enumerate(args):
+            if a == "--audio" and i + 1 < len(args):
+                audio = args[i + 1]
+                del args[i:i + 2]
+                break
+            if a.startswith("--audio="):
+                audio = a.split("=", 1)[1]
+                del args[i]
+                break
         if len(args) != 1:
-            cmdline.printerr("usage: video_inspect.py VIDEO.mp4\n")
+            cmdline.printerr("usage: video_inspect.py VIDEO.mp4 [--audio CLEAN_AUDIO_FILE]\n")
             return 2
         self.path = cmdline.create_file_for_arg(args[0])
+        self.audio_arg = cmdline.create_file_for_arg(audio).get_path() if audio else None
         self.activate()
         return 0
 
@@ -820,12 +977,18 @@ class App(Gtk.Application):
         header = Gtk.HeaderBar()
         menu = Gio.Menu()
         menu.append("Add marker at current position  (M)", "win.add-marker")
+        menu.append("Play clean audio track", "win.clean-audio")
         mb = Gtk.MenuButton(icon_name="open-menu-symbolic", menu_model=menu)
         header.pack_end(mb)
         self.win.set_titlebar(header)
         act = Gio.SimpleAction.new("add-marker", None)
         act.connect("activate", lambda *_: self.add_marker())
         self.win.add_action(act)
+        self.clean_act = Gio.SimpleAction.new_stateful(
+            "clean-audio", None, GLib.Variant.new_boolean(False))
+        self.clean_act.set_enabled(False)   # enabled once a clean track is aligned and loaded
+        self.clean_act.connect("change-state", self.on_clean_audio_toggled)
+        self.win.add_action(self.clean_act)
 
         self.media = Player(self.path.get_uri(), self.on_frame, self.on_ended,
                             lambda m: print("media error:", m, file=sys.stderr),
@@ -909,6 +1072,7 @@ class App(Gtk.Application):
         paned.set_shrink_end_child(False)
         self.win.set_child(paned)
         self.reload_segments()
+        self.setup_audio()
 
         keys = Gtk.EventControllerKey()
         keys.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
@@ -1087,10 +1251,32 @@ class App(Gtk.Application):
                     layer.edges.append((common.circle, cells[n + 1].circle))
                 else:
                     layer.edges.append((cells[n].circle, common.circle))
+            downs = [(cell, cell.get_last_child() if mode == "in" else cell.get_first_child())
+                     for cell in cells]
+            parts = [row, common]
+
+            def set_up(up, grp=grp, parts=parts, downs=downs, layer=layer):
+                """In a column that runs upwards the flow (and so the numbering) goes bottom to top."""
+                if getattr(grp, "up", None) == up:
+                    return
+                grp.up = up
+                first_row = (mode == "in") != up        # is the side-by-side row on top?
+                for w in parts:
+                    grp.remove(w)
+                for w in ([row, common] if first_row else [common, row]):
+                    grp.append(w)
+                for cell, lbl in downs:
+                    lbl.set_text("↑" if up else "↓")
+                    cell.remove(lbl)
+                    if first_row:
+                        cell.append(lbl)                # arrow below the cell, towards the common one
+                    else:
+                        cell.prepend(lbl)
+                layer.queue_draw()
             overlay = Gtk.Overlay(child=grp)
             overlay.add_overlay(layer)
-            grp = overlay
-            return grp
+            overlay.set_up = set_up
+            return overlay
 
         for n, node in enumerate(find_structure(tokens)):
             if node[0] == "seg":
@@ -1105,10 +1291,26 @@ class App(Gtk.Application):
             title = Gtk.Label(label=f"↻ ×{count}", xalign=0)
             title.add_css_class("seg-group-title")
             inner = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+            parts = []  # item, arrow, item, ... in reading order
             for j in range(length):
                 if j:
-                    inner.append(arrow())
-                inner.append(item(i + j, [i + r * length + j for r in range(count)]))
+                    parts.append(arrow())
+                parts.append(item(i + j, [i + r * length + j for r in range(count)]))
+
+            def set_up(up, inner=inner, parts=parts):
+                """In a column that runs upwards the first segment is at the bottom."""
+                if getattr(inner, "up", None) == up:
+                    return
+                inner.up = up
+                for w in parts:
+                    if w.get_parent() is inner:
+                        inner.remove(w)
+                    if isinstance(w, Gtk.Label):
+                        w.set_text("↑" if up else "↓")
+                for w in (reversed(parts) if up else parts):
+                    inner.append(w)
+            grp.set_up = set_up
+            set_up(False)
             grp.append(title)
             grp.append(inner)
             nodes.append(grp)
@@ -1491,7 +1693,60 @@ class App(Gtk.Application):
         if not maximized:  # keep the previous normal size while maximized
             self.win_size = (win.get_width(), win.get_height())
         save_window_state(*self.win_size, maximized)
+        if self.media.audio:
+            self.media.audio.stop()
         return False
+
+    # -- clean audio track -------------------------------------------------
+    def setup_audio(self):
+        """Use the clean audio given with --audio (or remembered for this video), aligning it first."""
+        saved = self.segdb.get_audio()
+        path = self.audio_arg or (saved[0] if saved else None)
+        if not path:
+            return
+        try:
+            st = os.stat(path)
+        except OSError as e:
+            print("clean audio not available:", e, file=sys.stderr)
+            return
+        if saved and saved[0] == path and saved[1] == st.st_size and saved[2] == st.st_mtime:
+            self.install_audio(path, saved[4], saved[3])
+            return
+        # not aligned yet (or the file changed): analyse it in the background (takes a few seconds)
+        self.win.set_title("Video Inspect – aligning audio…")
+
+        def work():
+            try:
+                import audio_sync
+                anchors, info = audio_sync.compute_anchors(self.path.get_path(), path)
+                GLib.idle_add(self.audio_aligned, path, st, anchors, info, None)
+            except Exception as e:  # missing ffmpeg/numpy, or the audio doesn't match
+                GLib.idle_add(self.audio_aligned, path, st, None, None, e)
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def audio_aligned(self, path, st, anchors, info, error):
+        self.win.set_title("Video Inspect")
+        if error is not None:
+            print("could not align the clean audio:", error, file=sys.stderr)
+            self.win.set_title("Video Inspect – audio alignment failed")
+            return False
+        print(f"clean audio aligned: {len(anchors)} stretches, max error "
+              f"{info['max_error_s'] * 1000:.0f} ms", file=sys.stderr)
+        self.segdb.set_audio(path, st.st_size, st.st_mtime, True, anchors)
+        self.install_audio(path, anchors, True)
+        return False
+
+    def install_audio(self, path, anchors, enabled):
+        self.media.audio = AudioTrack(path, anchors)
+        self.clean_act.set_enabled(True)
+        self.clean_act.change_state(GLib.Variant.new_boolean(enabled))
+
+    def on_clean_audio_toggled(self, action, value):
+        on = value.get_boolean()
+        action.set_state(value)
+        self.media.set_clean_audio(on, self.position)
+        self.segdb.set_audio_enabled(on)
 
     # -- media callbacks ---------------------------------------------------
     def on_prepared(self):
@@ -1507,6 +1762,7 @@ class App(Gtk.Application):
         pos = self.media.get_position()
         if pos is not None:
             self.position = pos
+            self.media.sync_audio(pos)
             self.check_selection()
         self.refresh()
         return True
