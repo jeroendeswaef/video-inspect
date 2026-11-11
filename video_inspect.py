@@ -83,7 +83,7 @@ def save_window_state(width, height, maximized):
         print("could not save window state:", e, file=sys.stderr)
 
 
-SPEEDS = [0.1, 0.25, 0.5, 0.75, 1.0, 1.5, 2.0]
+SPEEDS = [0.1, 0.25, 0.5, 0.75, 0.8, 0.85, 1.0, 1.5, 2.0]
 
 
 class Player:
@@ -280,6 +280,7 @@ class SnakeBox(Gtk.Widget):
         self.nodes, self.arrows = [], []
         self._height = 0
         self._total = 0
+        self.on_layout = None  # called after every allocation (to redraw overlays)
 
     def set_nodes(self, nodes):
         for c in self.nodes + self.arrows:
@@ -384,6 +385,91 @@ class SnakeBox(Gtk.Widget):
                 else:  # link to the next column: vertically centred on this column's last child
                     label.set_text("→")
                     place(label, x + colw + (self.GAP - aw) / 2, tops[i] + nh[i] / 2 - ah / 2, aw, ah)
+        if self.on_layout:
+            self.on_layout()
+
+
+class ActiveLayer(Gtk.Widget):
+    """Overlay that marks the circle(s) of the segment being played.
+
+    Draws a thin white ring inside a black ring around the circle, and a small black
+    triangular notch in the circle on its left and right side.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.circles = []
+        self.set_can_target(False)
+        self.set_can_focus(False)
+
+    def do_snapshot(self, snap):
+        black, white = Gdk.RGBA(), Gdk.RGBA()
+        black.red = black.green = black.blue = 0.08
+        white.red = white.green = white.blue = 1
+        black.alpha = white.alpha = 1
+        for c in self.circles:
+            ok, b = c.compute_bounds(self)
+            if not ok:
+                continue
+            cx, cy, r = b.get_x() + b.get_width() / 2, b.get_y() + b.get_height() / 2, b.get_width() / 2
+            for radius, width, col in ((r + 4.5, 2.0, black), (r + 2.5, 1.6, white)):
+                pb = Gsk.PathBuilder.new()
+                center = Graphene.Point()
+                center.init(cx, cy)
+                pb.add_circle(center, radius)
+                snap.append_stroke(pb.to_path(), Gsk.Stroke.new(width), col)
+            # triangular notches in the left and right edge, tips pointing at the centre
+            for sign in (-1, 1):
+                nb = Gsk.PathBuilder.new()
+                nb.move_to(cx + sign * (r + 5), cy - 6)
+                nb.line_to(cx + sign * (r - 5), cy)
+                nb.line_to(cx + sign * (r + 5), cy + 6)
+                nb.close()
+                snap.append_fill(nb.to_path(), Gsk.FillRule.WINDING, black)
+
+
+class RowMarkerLayer(Gtk.Widget):
+    """Overlay on the segment list: black triangular notches on the left and right edge of the
+    row that is currently playing, pointing into the row (like the marker on the circles)."""
+
+    def __init__(self):
+        super().__init__()
+        self.row = None
+        self._last = None
+        self.set_can_target(False)
+        self.set_can_focus(False)
+        self.add_tick_callback(self._tick)
+
+    def _bounds(self):
+        if self.row is None:
+            return None
+        ok, b = self.row.compute_bounds(self)
+        return (b.get_x(), b.get_y(), b.get_width(), b.get_height()) if ok else None
+
+    def _tick(self, widget, clock):
+        # the row moves/resizes (scrolling, hover animation): redraw only when it did
+        cur = self._bounds()
+        if cur != self._last:
+            self._last = cur
+            self.queue_draw()
+        return True
+
+    def do_snapshot(self, snap):
+        b = self._bounds()
+        if b is None:
+            return
+        x, y, w, h = b
+        cy = y + h / 2
+        black = Gdk.RGBA()
+        black.red = black.green = black.blue = 0.08
+        black.alpha = 1
+        for edge, sign in ((x, 1), (x + w, -1)):  # tips point into the row
+            pb = Gsk.PathBuilder.new()
+            pb.move_to(edge, cy - 6)
+            pb.line_to(edge + sign * 7, cy)
+            pb.line_to(edge, cy + 6)
+            pb.close()
+            snap.append_fill(pb.to_path(), Gsk.FillRule.WINDING, black)
 
 
 class Timeline(Gtk.Widget):
@@ -700,7 +786,6 @@ class App(Gtk.Application):
             "row button.flat { min-height: 0; min-width: 0; padding: 0 6px; }"
             "button.seg-circle { border-radius: 999px; min-width: 38px; min-height: 38px; padding: 0;"
             " color: white; font-weight: bold; border: none; box-shadow: none; background-image: none; }"
-            "button.seg-circle.active { box-shadow: 0 0 0 3px #e53935; }"
             + "".join(f"button.seg-circle.c{i} {{ background-color: {c}; }}"
                       for i, c in enumerate(DIAGRAM_COLORS))
             + "".join(f"row.seg-row.rc{i} {{ background-color: alpha({c}, 0.6); }}"
@@ -847,7 +932,10 @@ class App(Gtk.Application):
         self.seg_list.add_controller(click)
         self.pick = None         # (first_id, last_id) of the selected consecutive segments
         self.pick_anchor = None  # id of the segment a Shift+click range starts from
-        sw = self.seg_sw = Gtk.ScrolledWindow(child=self.seg_list, vexpand=True)
+        self.row_marker = RowMarkerLayer()
+        overlay = Gtk.Overlay(child=self.seg_list)
+        overlay.add_overlay(self.row_marker)
+        sw = self.seg_sw = Gtk.ScrolledWindow(child=overlay, vexpand=True)
         sw.set_overlay_scrolling(False)
         sw.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
         frame = Gtk.Frame(child=sw)
@@ -862,7 +950,7 @@ class App(Gtk.Application):
         self._conflict_key = None
 
         panel = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
-        panel.set_size_request(340, -1)
+        panel.set_size_request(375, -1)
         for m in ("top", "bottom", "start", "end"):
             getattr(panel, f"set_margin_{m}")(8)
         panel.append(frame)
@@ -895,7 +983,11 @@ class App(Gtk.Application):
         self.diagram_box = SnakeBox()
         for m in ("top", "bottom", "start", "end"):
             getattr(self.diagram_box, f"set_margin_{m}")(8)
-        sw = Gtk.ScrolledWindow(child=self.diagram_box)
+        self.active_layer = ActiveLayer()
+        self.diagram_box.on_layout = self.active_layer.queue_draw
+        overlay = Gtk.Overlay(child=self.diagram_box)
+        overlay.add_overlay(self.active_layer)
+        sw = Gtk.ScrolledWindow(child=overlay)
         sw.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
         sw.set_propagate_natural_width(True)  # extra columns make the diagram wider
         sw.set_overlay_scrolling(False)  # keep the scrollbar visible when it overflows
@@ -1060,12 +1152,17 @@ class App(Gtk.Application):
                 self.scroll_into_view(c, self.diagram_box, self.diagram_sw)
             else:
                 c.remove_css_class("active")
+        self.active_layer.circles = [c for c in self.circles if c.has_css_class("active")]
+        self.active_layer.queue_draw()
+        self.row_marker.row = None
         for row in self.seg_rows:
             if row.seg[0] == active:
                 row.add_css_class("current")
+                self.row_marker.row = row
                 self.scroll_row_into_view(row)
             else:
                 row.remove_css_class("current")
+        self.row_marker.queue_draw()
 
     def scroll_row_into_view(self, row):
         self.scroll_into_view(row, self.seg_list, self.seg_sw)
@@ -1114,7 +1211,8 @@ class App(Gtk.Application):
         row = Gtk.ListBoxRow(activatable=False)
         row.add_css_class("gap-row")
         row.gap = (a, b)
-        label = Gtk.Label(label=f"＋ gap  {fmt(a)} – {fmt(b)}  ({(b - a) / SEC:.2f}s)", xalign=0)
+        label = Gtk.Label(label=f"＋ gap  {fmt(a)} – {fmt(b)}  ({(b - a) / SEC:.2f}s)", xalign=0,
+                          ellipsize=3)
         label.add_css_class("monospace")
         row.set_child(label)
         row.set_tooltip_text("Click to add a segment that fills this gap")
@@ -1137,7 +1235,8 @@ class App(Gtk.Application):
         row.color_cls = None
         row.seg = (sid, a, b)
 
-        times = Gtk.Label(label=f"{fmt(a)} – {fmt(b)}  ({(b - a) / SEC:.2f}s)", xalign=0, hexpand=True)
+        times = Gtk.Label(label=f"{fmt(a)} – {fmt(b)}  ({(b - a) / SEC:.2f}s)", xalign=0, hexpand=True,
+                          ellipsize=3)  # let the row shrink instead of overflowing the list
         times.add_css_class("monospace")
 
         def ibtn(label, tip, cb):
@@ -1443,7 +1542,8 @@ class App(Gtk.Application):
     def on_speed_selected(self, dd, _p):
         rate = SPEEDS[dd.get_selected()]
         if rate != self.media.rate:
-            self.media.set_rate(rate)
+            # use our own position: the pipeline's can lag behind a seek issued just before
+            self.media.seek(self.position, rate)
 
     def change_speed(self, d):
         i = min(max(self.speed_dd.get_selected() + d, 0), len(SPEEDS) - 1)
