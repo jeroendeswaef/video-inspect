@@ -17,9 +17,12 @@ Keys:
   C            clear markers
   [ / ]        slower / faster playback
   A            add a segment from the markers
+  (list)       click a segment, Shift+click to select consecutive segments;
+               P loops the combined time range
   R            rotate the video view 90 degrees
 """
 import os
+import re
 import sqlite3
 import sys
 import threading
@@ -260,8 +263,21 @@ class Timeline(Gtk.Widget):
 
 
 def norm_desc(desc):
-    d = (desc or "").strip().lower()
+    """Key used to decide which segments are 'the same' (grouping and colours).
+
+    Anything in [square brackets] is a variation and is ignored, so
+    "apple jacks [back]" and "apple jacks" are the same thing.
+    """
+    d = " ".join(re.sub(r"\[[^\]]*\]", " ", desc or "").split()).lower()
     return d or None
+
+
+def display_desc(descs):
+    """Description shown for a group of 'same' segments: prefer one without a [variation]."""
+    for d in descs:
+        if d and d.strip() and not re.search(r"\[[^\]]*\]", d):
+            return d
+    return descs[0]
 
 
 def find_structure(tokens):
@@ -399,6 +415,7 @@ class App(Gtk.Application):
             + "".join(f"row.seg-row.rc{i} {{ background-color: alpha({c}, 0.6); }}"
                       for i, c in enumerate(DIAGRAM_COLORS)) +
             "row.seg-row { border-bottom: 1px solid white; }"
+            "row.seg-row.picked { border-right: 5px solid #1e88e5; }"
             "row.seg-row.current { box-shadow: inset 5px 0 0 #e53935;"
             " background-image: linear-gradient(rgba(229,57,53,0.22), rgba(229,57,53,0.22)); }"
             "row.seg-row.current entry.seg-entry { font-weight: bold; }"
@@ -507,7 +524,11 @@ class App(Gtk.Application):
         self.seg_list = Gtk.ListBox()
         self.seg_list.set_selection_mode(Gtk.SelectionMode.NONE)
         self.seg_rows = []
-        self.seg_list.connect("row-activated", self.on_segment_activated)
+        click = Gtk.GestureClick()
+        click.connect("pressed", self.on_list_click)
+        self.seg_list.add_controller(click)
+        self.pick = None         # (first_id, last_id) of the selected consecutive segments
+        self.pick_anchor = None  # id of the segment a Shift+click range starts from
         sw = self.seg_sw = Gtk.ScrolledWindow(child=self.seg_list, vexpand=True)
         sw.set_overlay_scrolling(False)
         sw.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
@@ -517,6 +538,7 @@ class App(Gtk.Application):
         self.add_btn.set_tooltip_text("A  (needs a start and an end marker)")
         self.add_btn.connect("clicked", lambda *_: self.add_segment())
 
+        self.pick_label = Gtk.Label(xalign=0, wrap=True)
         self.seg_status = Gtk.Label(label="", xalign=0, wrap=True)
         self.seg_status.add_css_class("error")
         self._conflict_key = None
@@ -528,6 +550,7 @@ class App(Gtk.Application):
         panel.append(title)
         panel.append(dbl)
         panel.append(frame)
+        panel.append(self.pick_label)
         panel.append(self.seg_status)
         panel.append(self.add_btn)
         return panel
@@ -592,16 +615,18 @@ class App(Gtk.Application):
             circle.add_css_class("seg-circle")
             circle.add_css_class(f"c{color_of[tokens[i]]}" if tokens[i] is not None else "c7")
             circle.occ = [segs[j] for j in occ]
+            varied = len({o[3] for o in circle.occ}) > 1  # differ only by [variations]
             lines = [f"{fmt(a)} – {fmt(b)}" + (f"  #{n + 1}" if len(occ) > 1 else "")
-                     for n, (_, a, b, _d) in enumerate(circle.occ)]
-            if segs[i][3]:
+                     + (f"  {d}" if varied else "")
+                     for n, (_, a, b, d) in enumerate(circle.occ)]
+            if segs[i][3] and not varied:
                 lines.insert(0, segs[i][3])
             if len(occ) > 1:
                 lines.append(f"repeats ×{len(occ)} – click to cycle through them")
             circle.set_tooltip_text("\n".join(lines))
             circle.connect("clicked", self.on_circle_clicked)
             self.circles.append(circle)
-            cap = Gtk.Label(label=segs[i][3] or "–", max_width_chars=16, ellipsize=3,
+            cap = Gtk.Label(label=display_desc([o[3] for o in circle.occ]) or "–", max_width_chars=16, ellipsize=3,
                             xalign=0, hexpand=True)
             cap.add_css_class("caption")
             vb.append(circle)
@@ -702,6 +727,7 @@ class App(Gtk.Application):
         self.recolor_rows()
         self._active_id = None
         self.update_active()
+        self.apply_pick()
 
     def make_segment_row(self, sid, a, b, desc):
         row = Gtk.ListBoxRow()
@@ -768,12 +794,73 @@ class App(Gtk.Application):
         self.start, self.end = a, b
         self.seek(a, user=True)
 
-    def on_segment_activated(self, lb, row):
-        self.load_segment(row.seg)
+    # -- selecting consecutive segments --------------------------------------
+    def seg_index(self, sid):
+        return next((i for i, sg in enumerate(self.segments) if sg[0] == sid), None)
+
+    def pick_range(self):
+        """Indices (i0, i1) of the selected segments, or None."""
+        if not self.pick:
+            return None
+        i0, i1 = self.seg_index(self.pick[0]), self.seg_index(self.pick[1])
+        return None if i0 is None or i1 is None else (i0, i1)
+
+    def pick_union(self):
+        r = self.pick_range()
+        return None if r is None else (self.segments[r[0]][1], self.segments[r[1]][2])
+
+    def on_list_click(self, gesture, n_press, x, y):
+        row = self.seg_list.get_row_at_y(int(y))
+        if row is None:
+            return
+        self.win.set_focus(None)  # leave any description box so shortcuts work again
+        sid = row.seg[0]
+        shift = gesture.get_current_event_state() & Gdk.ModifierType.SHIFT_MASK
+        anchor = self.seg_index(self.pick_anchor) if self.pick_anchor is not None else None
+        if shift and anchor is not None:
+            i0, i1 = sorted((anchor, self.seg_index(sid)))
+            self.start, self.end = self.segments[i0][1], self.segments[i1][2]
+            self.pick = (self.segments[i0][0], self.segments[i1][0])
+            self.seek(self.start, user=True)
+        else:
+            self.pick_anchor = sid
+            self.load_segment(row.seg)
+            self.pick = (sid, sid)
+        self.apply_pick()
+
+    def apply_pick(self):
+        r = self.pick_range()
+        if r is None:
+            self.pick = None
+        for i, row in enumerate(self.seg_rows):
+            if r is not None and r[0] <= i <= r[1]:
+                row.add_css_class("picked")
+            else:
+                row.remove_css_class("picked")
+        if r is not None and r[1] > r[0]:
+            a, b = self.pick_union()
+            self.pick_label.set_text(f"{r[1] - r[0] + 1} segments selected: {fmt(a)} – {fmt(b)} "
+                                     f"({(b - a) / SEC:.2f}s). Play selection (P) loops them.")
+        else:
+            self.pick_label.set_text("Shift+click to select several consecutive segments")
+
+    def validate_pick(self):
+        """Drop the selection as soon as the markers no longer match it."""
+        if self.pick and self.pick_union() != (self.start, self.end):
+            self.pick = None
+            self.apply_pick()
 
     def play_segment(self, seg):
-        self.load_segment(seg)
-        self.play_selection()
+        r = self.pick_range()
+        i = self.seg_index(seg[0])
+        if r is not None and r[1] > r[0] and r[0] <= i <= r[1]:
+            self.play_selection()  # markers already span the whole selection
+        else:
+            self.load_segment(seg)
+            self.pick = (seg[0], seg[0])
+            self.pick_anchor = seg[0]
+            self.apply_pick()
+            self.play_selection()
 
     def can_add(self):
         return self.start is not None and self.end is not None and self.end > self.start
@@ -859,6 +946,7 @@ class App(Gtk.Application):
         self.play_btn.set_label("⏸ Pause" if self.media.playing else "▶ Play")
         self.update_add_state()
         self.update_active()
+        self.validate_pick()
         self.timeline.queue_draw()
 
     def on_speed_selected(self, dd, _p):
